@@ -1,15 +1,19 @@
 """
 Webcam stream over HTTP: 640x640, 70% JPEG, MJPEG at GET /video.
 Optional local Visual Audit: set ENABLE_LOCAL_AUDIT=1 to run Ollama (MiniCPM-V 2.6) on frames.
+Optional listening: set ENABLE_AUDIO_STT=1 to capture mic audio and transcribe via OpenAI STT.
 """
 import asyncio
 import base64
+import io
 import logging
 import os
+import wave
 from contextlib import asynccontextmanager
 
 import cv2
 import httpx
+import sounddevice as sd
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
@@ -28,6 +32,16 @@ AUDIT_USER_PROMPT = (
     "Identify the primary person in this frame. What are they wearing? What are they doing? "
     "Give me a 1-sentence tactical warning addressing their specific outfit."
 )
+
+# Optional audio transcription (cloud STT)
+ENABLE_AUDIO_STT = os.environ.get("ENABLE_AUDIO_STT", "").strip().lower() in ("1", "true", "yes")
+OPENAI_STT_API_KEY = os.environ.get("OPENAI_STT_API_KEY") or os.environ.get("OPENAI_API_KEY")
+OPENAI_STT_MODEL = os.environ.get("OPENAI_STT_MODEL", "whisper-1")
+STT_SAMPLE_RATE = int(os.environ.get("STT_SAMPLE_RATE", "16000"))
+STT_DURATION_SEC = float(os.environ.get("STT_DURATION_SEC", "5.0"))
+STT_GAP_SEC = float(os.environ.get("STT_GAP_SEC", "0.0"))
+
+latest_transcript: str = ""
 
 # Global camera; set in lifespan, released on shutdown.
 cap: cv2.VideoCapture | None = None
@@ -73,6 +87,56 @@ async def video_stream_generator():
         yield header + jpeg_bytes
 
 
+def _record_audio_chunk() -> bytes | None:
+    """Record STT_DURATION_SEC of mono audio from the default mic, return WAV bytes."""
+    try:
+        n_samples = int(STT_SAMPLE_RATE * STT_DURATION_SEC)
+        audio = sd.rec(n_samples, samplerate=STT_SAMPLE_RATE, channels=1, dtype="int16")
+        sd.wait()
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # int16
+            wf.setframerate(STT_SAMPLE_RATE)
+            wf.writeframes(audio.tobytes())
+        buf.seek(0)
+        return buf.read()
+    except Exception as exc:
+        logger.debug("Audio capture failed: %s", exc)
+        return None
+
+
+async def audio_transcription_loop() -> None:
+    """Background task: capture audio, send to OpenAI STT, update latest_transcript."""
+    global latest_transcript
+    if not OPENAI_STT_API_KEY:
+        logger.warning(
+            "ENABLE_AUDIO_STT is set but no OPENAI_STT_API_KEY/OPENAI_API_KEY provided; audio STT disabled."
+        )
+        return
+    url = "https://api.openai.com/v1/audio/transcriptions"
+    headers = {"Authorization": f"Bearer {OPENAI_STT_API_KEY}"}
+    while True:
+        wav_bytes = await asyncio.to_thread(_record_audio_chunk)
+        if not wav_bytes:
+            await asyncio.sleep(1.0)
+            continue
+        files = {"file": ("audio.wav", wav_bytes, "audio/wav")}
+        data = {"model": OPENAI_STT_MODEL}
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(url, headers=headers, files=files, data=data, timeout=90.0)
+            resp.raise_for_status()
+            text = (resp.json().get("text") or "").strip()
+            if text:
+                latest_transcript = text
+                logger.info("Heard: %s", text)
+        except Exception as exc:
+            logger.debug("STT request failed: %s", exc)
+        if STT_GAP_SEC > 0:
+            await asyncio.sleep(STT_GAP_SEC)
+
+
 async def local_audit_loop() -> None:
     """Background task: every AUDIT_INTERVAL_SEC, grab a frame and send to Ollama for Visual Audit."""
     while True:
@@ -81,7 +145,14 @@ async def local_audit_loop() -> None:
         if not jpeg_bytes:
             continue
         b64 = base64.standard_b64encode(jpeg_bytes).decode("ascii")
-        full_prompt = AUDIT_SYSTEM_PROMPT + "\n\n" + AUDIT_USER_PROMPT
+        # Incorporate latest transcript into the prompt if available.
+        context = AUDIT_USER_PROMPT
+        if latest_transcript:
+            context += (
+                f'\n\nThe person is saying: "{latest_transcript}". '
+                "Factor this audio into your tactical warning."
+            )
+        full_prompt = AUDIT_SYSTEM_PROMPT + "\n\n" + context
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
@@ -106,16 +177,22 @@ async def local_audit_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Open camera on startup, release on shutdown. Optionally start local audit task."""
+    """Open camera on startup, release on shutdown. Optionally start local audit + audio STT tasks."""
     global cap
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         logger.error("Failed to open camera (index 0)")
         cap = None
     audit_task = None
+    audio_task = None
     if ENABLE_LOCAL_AUDIT and cap is not None:
         audit_task = asyncio.create_task(local_audit_loop())
         logger.info("Local Visual Audit enabled (model=%s, interval=%.1fs)", OLLAMA_VISION_MODEL, AUDIT_INTERVAL_SEC)
+    if ENABLE_AUDIO_STT:
+        audio_task = asyncio.create_task(audio_transcription_loop())
+        logger.info(
+            "Audio STT enabled (model=%s, duration=%.1fs)", OPENAI_STT_MODEL, STT_DURATION_SEC
+        )
     try:
         yield
     finally:
@@ -123,6 +200,12 @@ async def lifespan(app: FastAPI):
             audit_task.cancel()
             try:
                 await audit_task
+            except asyncio.CancelledError:
+                pass
+        if audio_task is not None:
+            audio_task.cancel()
+            try:
+                await audio_task
             except asyncio.CancelledError:
                 pass
         if cap is not None:
@@ -162,3 +245,9 @@ async def video():
         video_stream_generator(),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+@app.get("/transcript")
+async def transcript():
+    """Return the latest audio transcript (if any)."""
+    return {"text": latest_transcript}

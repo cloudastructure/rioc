@@ -34,6 +34,8 @@ BOUNDARY = b"frame"
 HEADER_END = b"\r\n\r\n"
 CONTENT_LENGTH_RE = re.compile(rb"Content-Length:\s*(\d+)", re.IGNORECASE)
 
+TRANSCRIPT_URL = os.environ.get("TRANSCRIPT_URL") or f"{STREAM_URL.rstrip('/')}/transcript"
+
 
 def parse_mjpeg_frames(stream_url: str):
     """
@@ -78,16 +80,22 @@ def parse_mjpeg_frames(stream_url: str):
                 yield jpeg_bytes
 
 
-def run_visual_audit(client: OpenAI, jpeg_bytes: bytes) -> str:
-    """Send one frame to the model; return the assistant reply."""
+def run_visual_audit(client: OpenAI, jpeg_bytes: bytes, transcript: str | None = None) -> str:
+    """Send one frame (and optional transcript) to the model; return the assistant reply."""
     b64 = base64.standard_b64encode(jpeg_bytes).decode("ascii")
+    text = USER_PROMPT
+    if transcript:
+        text += (
+            f'\n\nThe person is saying: "{transcript}". '
+            "Combine what you see and hear in your tactical warning."
+        )
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
             "role": "user",
             "content": [
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                {"type": "text", "text": USER_PROMPT},
+                {"type": "text", "text": text},
             ],
         },
     ]
@@ -115,7 +123,14 @@ def main() -> None:
                 continue
             last_audit_time = now
             try:
-                audit = run_visual_audit(client, jpeg_bytes)
+                transcript = ""
+                try:
+                    resp = httpx.get(TRANSCRIPT_URL, timeout=1.0)
+                    if resp.status_code == 200:
+                        transcript = (resp.json().get("text") or "").strip()
+                except httpx.RequestError:
+                    transcript = ""
+                audit = run_visual_audit(client, jpeg_bytes, transcript or None)
                 if audit:
                     print(f"[Visual Audit] {audit}")
                 else:

@@ -37,7 +37,17 @@ Then open http://localhost:8000 or http://localhost:8000/video in a browser.
 ENABLE_LOCAL_AUDIT=1 uvicorn webcam_stream:app --host 0.0.0.0 --port 8000
 ```
 
-Audit results print in the server console every few seconds. Optional env: `OLLAMA_URL` (default `http://localhost:11434`), `OLLAMA_VISION_MODEL` (default `openbmb/minicpm-v2.6`), `AUDIT_INTERVAL_SEC` (default `5.0`).
+Audit results print in the server console every few seconds.
+
+**Optional: Listening (audio STT)** — Let the guard “hear” as well as see:
+
+```bash
+ENABLE_AUDIO_STT=1 OPENAI_STT_API_KEY=sk-your-key uvicorn webcam_stream:app --host 0.0.0.0 --port 8000
+```
+
+The app will capture microphone audio, send it to OpenAI’s STT (`whisper-1` by default), and expose the latest transcript at `GET /transcript`. The local Visual Audit and Cloud Brain can incorporate this transcript into their tactical warnings.
+
+Optional env: `OLLAMA_URL` (default `http://localhost:11434`), `OLLAMA_VISION_MODEL` (default `openbmb/minicpm-v2.6`), `AUDIT_INTERVAL_SEC` (default `5.0`), `ENABLE_AUDIO_STT` (enable/disable), `OPENAI_STT_MODEL` (default `whisper-1`), `STT_SAMPLE_RATE`, `STT_DURATION_SEC`, `STT_GAP_SEC`.
 
 ### Vision test (Rioc)
 
@@ -67,6 +77,7 @@ python vision_test.py
 | `VLLM_BASE_URL` | vLLM OpenAI-compatible API base (e.g. `http://<vllm-host>:8000/v1`) | `http://localhost:8000/v1` |
 | `AUDIT_INTERVAL_SEC` | Seconds between audits | `5.0` |
 | `OPENAI_API_KEY` | API key for vLLM (use `EMPTY` if none) | `EMPTY` |
+| `TRANSCRIPT_URL` | URL for latest transcript JSON (default `<STREAM_URL>/transcript`) | derived |
 
 **Run:**
 
