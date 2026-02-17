@@ -102,7 +102,7 @@ def _record_audio_chunk() -> bytes | None:
         buf.seek(0)
         return buf.read()
     except Exception as exc:
-        logger.debug("Audio capture failed: %s", exc)
+        logger.warning("Audio capture failed: %s", exc)
         return None
 
 
@@ -131,8 +131,9 @@ async def audio_transcription_loop() -> None:
             if text:
                 latest_transcript = text
                 logger.info("Heard: %s", text)
+                print(f"[Rioc] Heard: {text}")
         except Exception as exc:
-            logger.debug("STT request failed: %s", exc)
+            logger.warning("STT request failed: %s", exc)
         if STT_GAP_SEC > 0:
             await asyncio.sleep(STT_GAP_SEC)
 
@@ -193,6 +194,10 @@ async def lifespan(app: FastAPI):
         logger.info(
             "Audio STT enabled (model=%s, duration=%.1fs)", OPENAI_STT_MODEL, STT_DURATION_SEC
         )
+        if OPENAI_STT_API_KEY:
+            print("[Rioc] Listening. Speak to the camera; you'll see '[Rioc] Heard: ...' when your speech is transcribed.")
+        else:
+            print("[Rioc] Audio STT is ON but no OPENAI_STT_API_KEY/OPENAI_API_KEY set — listening disabled. Set the key and restart.")
     try:
         yield
     finally:
