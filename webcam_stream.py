@@ -3,6 +3,15 @@ Webcam stream over HTTP: 640x640, 70% JPEG, MJPEG at GET /video.
 Optional local Visual Audit: set ENABLE_LOCAL_AUDIT=1 to run Ollama (MiniCPM-V 2.6) on frames.
 Optional listening: set ENABLE_AUDIO_STT=1 to capture mic audio and transcribe via OpenAI STT.
 """
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load .env from project dir and from cwd (in case uvicorn is run from elsewhere)
+_project_dir = Path(__file__).resolve().parent
+load_dotenv(_project_dir / ".env")
+load_dotenv(Path.cwd() / ".env")
+
 import asyncio
 import base64
 import io
@@ -11,6 +20,7 @@ import os
 import wave
 from contextlib import asynccontextmanager
 
+import numpy as np
 import cv2
 import httpx
 import sounddevice as sd
@@ -40,8 +50,87 @@ OPENAI_STT_MODEL = os.environ.get("OPENAI_STT_MODEL", "whisper-1")
 STT_SAMPLE_RATE = int(os.environ.get("STT_SAMPLE_RATE", "16000"))
 STT_DURATION_SEC = float(os.environ.get("STT_DURATION_SEC", "5.0"))
 STT_GAP_SEC = float(os.environ.get("STT_GAP_SEC", "0.0"))
+STT_SILENCE_THRESHOLD = float(os.environ.get("STT_SILENCE_THRESHOLD", "300"))  # RMS below this = skip STT
 
 latest_transcript: str = ""
+
+# Whisper hallucination phrases to ignore (case-insensitive substring match)
+# Comprehensive list of common Whisper video-outro / non-speech hallucinations
+STT_HALLUCINATION_PHRASES = (
+    # English - video outros
+    "thank you for watching",
+    "thanks for watching",
+    "thank you so much",
+    "thank you very much",
+    "for watching",
+    "subscribe",
+    "like and subscribe",
+    "don't forget to subscribe",
+    "please subscribe",
+    "hit the bell",
+    "leave a comment",
+    "let me know in the comments",
+    "see you in the next",
+    "see you next time",
+    "until next time",
+    "bye bye",
+    "peace out",
+    "take care",
+    "goodbye",
+    "subscribe to my channel",
+    "youtube",
+    "end of",
+    "copyright",
+    "all rights reserved",
+    "music by",
+    "sound effects",
+    "translated by",
+    "subtitles by",
+    "subtitles",
+    # Japanese
+    "ありがとう",
+    "視聴",
+    "最後まで",
+    "ございます",
+    # Spanish/Portuguese
+    "gracias por ver",
+    "suscríbete",
+    "inscreva-se",
+    # Other common hallucinations
+    "the end",
+    "fin",
+    "ciao",
+    "adios",
+    "bye",
+    # Whisper echoing our own prompt back
+    "transcribe only",
+    "direct speech",
+)
+
+# Prompt to prime Whisper away from video-outro hallucinations
+STT_PROMPT = "A person is speaking to a security guard. Transcribe only their direct speech."
+
+
+def _is_stt_hallucination(text: str) -> bool:
+    """Return True if transcript matches known Whisper hallucination phrases."""
+    t = text.lower().strip()
+    if not t or len(t) < 8:
+        return True  # Very short outputs are often noise
+    return any(phrase in t for phrase in STT_HALLUCINATION_PHRASES)
+
+
+def _is_audio_silent(wav_bytes: bytes) -> bool:
+    """Return True if audio is mostly silence (skip STT to avoid hallucinations)."""
+    try:
+        with io.BytesIO(wav_bytes) as buf:
+            with wave.open(buf, "rb") as wf:
+                data = wf.readframes(wf.getnframes())
+        samples = np.frombuffer(data, dtype=np.int16)
+        rms = np.sqrt(np.mean(samples.astype(np.float64) ** 2))
+        return rms < STT_SILENCE_THRESHOLD
+    except Exception:
+        return False
+
 
 # Global camera; set in lifespan, released on shutdown.
 cap: cv2.VideoCapture | None = None
@@ -106,34 +195,73 @@ def _record_audio_chunk() -> bytes | None:
         return None
 
 
+def _print_audio(msg: str) -> None:
+    """Print with flush so it appears immediately in uvicorn output."""
+    print(msg, flush=True)
+
+
 async def audio_transcription_loop() -> None:
     """Background task: capture audio, send to OpenAI STT, update latest_transcript."""
     global latest_transcript
     if not OPENAI_STT_API_KEY:
-        logger.warning(
-            "ENABLE_AUDIO_STT is set but no OPENAI_STT_API_KEY/OPENAI_API_KEY provided; audio STT disabled."
-        )
+        _print_audio("[Rioc] Audio STT disabled: no OPENAI_STT_API_KEY or OPENAI_API_KEY in .env")
         return
+    _print_audio("[Rioc] Audio loop started. Recording 5s chunks, then sending to STT...")
     url = "https://api.openai.com/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {OPENAI_STT_API_KEY}"}
     while True:
+        _print_audio("[Rioc] Recording chunk (5 sec)...")
         wav_bytes = await asyncio.to_thread(_record_audio_chunk)
         if not wav_bytes:
+            _print_audio("[Rioc] Audio capture failed — check mic permissions (System Settings → Privacy → Microphone)")
             await asyncio.sleep(1.0)
             continue
+        if _is_audio_silent(wav_bytes):
+            continue  # Skip STT when silent — avoids hallucinations
+        _print_audio("[Rioc] Sending to STT...")
         files = {"file": ("audio.wav", wav_bytes, "audio/wav")}
-        data = {"model": OPENAI_STT_MODEL}
+        data = {"model": OPENAI_STT_MODEL, "prompt": STT_PROMPT}
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(url, headers=headers, files=files, data=data, timeout=90.0)
             resp.raise_for_status()
             text = (resp.json().get("text") or "").strip()
-            if text:
+            if text and not _is_stt_hallucination(text):
                 latest_transcript = text
-                logger.info("Heard: %s", text)
-                print(f"[Rioc] Heard: {text}")
+                _print_audio(f"[Rioc] Heard: {text}")
+                # Get Rioc to respond directly to what was said (when Ollama is available)
+                if ENABLE_LOCAL_AUDIT:
+                    try:
+                        async with httpx.AsyncClient() as client:
+                            r = await client.post(
+                                f"{OLLAMA_URL.rstrip('/')}/api/chat",
+                                json={
+                                    "model": OLLAMA_VISION_MODEL,
+                                    "messages": [
+                                        {
+                                            "role": "user",
+                                            "content": (
+                                                f"You are Rioc, a tactical guard. The person in front of you just said: \"{text}\". "
+                                                "Respond directly to them in one sentence. Cold, authoritative tone. Do not repeat what they said."
+                                            ),
+                                        },
+                                    ],
+                                    "stream": False,
+                                },
+                                timeout=30.0,
+                            )
+                        r.raise_for_status()
+                        reply = (r.json().get("message") or {}).get("content") or ""
+                        if reply.strip():
+                            _print_audio(f"[Rioc] {reply.strip()}")
+                    except Exception as e:
+                        logger.debug("Audio response failed: %s", e)
+            elif text and _is_stt_hallucination(text):
+                pass  # Silently ignore Whisper hallucinations
+            else:
+                _print_audio("[Rioc] STT returned empty (silence or very quiet audio)")
         except Exception as exc:
-            logger.warning("STT request failed: %s", exc)
+            _print_audio(f"[Rioc] STT failed: {exc}")
         if STT_GAP_SEC > 0:
             await asyncio.sleep(STT_GAP_SEC)
 
@@ -172,8 +300,10 @@ async def local_audit_loop() -> None:
             msg = (data.get("message") or {}).get("content") or ""
             if msg.strip():
                 print(f"[Visual Audit] {msg.strip()}")
+            else:
+                print("[Visual Audit] (model returned empty — ensure Ollama has openbmb/minicpm-v2.6 loaded)")
         except Exception as e:
-            logger.debug("Local audit request failed: %s", e)
+            print(f"[Visual Audit] Request failed: {e}")
 
 
 @asynccontextmanager
@@ -195,9 +325,13 @@ async def lifespan(app: FastAPI):
             "Audio STT enabled (model=%s, duration=%.1fs)", OPENAI_STT_MODEL, STT_DURATION_SEC
         )
         if OPENAI_STT_API_KEY:
-            print("[Rioc] Listening. Speak to the camera; you'll see '[Rioc] Heard: ...' when your speech is transcribed.")
+            _print_audio("[Rioc] Listening. Speak to the camera; you'll see '[Rioc] Heard: ...' when your speech is transcribed.")
         else:
-            print("[Rioc] Audio STT is ON but no OPENAI_STT_API_KEY/OPENAI_API_KEY set — listening disabled. Set the key and restart.")
+            _print_audio(
+                "[Rioc] Audio STT is ON but no API key found. Create a .env file in the project root with:\n"
+                "  OPENAI_STT_API_KEY=sk-proj-your-key\n"
+                f"  (Project root: {_project_dir})"
+            )
     try:
         yield
     finally:
