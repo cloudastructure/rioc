@@ -17,14 +17,17 @@ import base64
 import io
 import logging
 import os
+import tempfile
 import wave
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
 import numpy as np
 import cv2
 import httpx
 import sounddevice as sd
 from fastapi import FastAPI
+from openai import OpenAI
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
 logger = logging.getLogger(__name__)
@@ -52,7 +55,32 @@ STT_DURATION_SEC = float(os.environ.get("STT_DURATION_SEC", "5.0"))
 STT_GAP_SEC = float(os.environ.get("STT_GAP_SEC", "0.0"))
 STT_SILENCE_THRESHOLD = float(os.environ.get("STT_SILENCE_THRESHOLD", "300"))  # RMS below this = skip STT
 
+# Optional TTS + speaker output (Rioc speaks through IP speaker)
+ENABLE_SPEAKER_TTS = os.environ.get("ENABLE_SPEAKER_TTS", "").strip().lower() in ("1", "true", "yes")
+SPEAKER_URL = (os.environ.get("SPEAKER_URL") or "").rstrip("/")
+SPEAKER_WS_URL = os.environ.get("SPEAKER_WS_URL", "").strip()
+if not SPEAKER_WS_URL and SPEAKER_URL:
+    # Derive from SPEAKER_URL: https://192.168.10.183 -> wss://192.168.10.183:8000/webtwowayaudio
+    p = urlparse(SPEAKER_URL)
+    host = p.hostname or p.netloc.split(":")[0]
+    SPEAKER_WS_URL = f"wss://{host}:8000/webtwowayaudio"
+SPEAKER_USER = os.environ.get("SPEAKER_USER", "")
+SPEAKER_PASS = os.environ.get("SPEAKER_PASS", "")
+SPEAKER_PLAY_PATH = os.environ.get("SPEAKER_PLAY_PATH", "/play")
+# Paths to try in order (first from env, then these fallbacks)
+SPEAKER_PLAY_FALLBACK_PATHS = [p.strip() for p in (os.environ.get("SPEAKER_PLAY_FALLBACK_PATHS") or "/api/play,/tts,/speak,/api/tts").split(",") if p.strip()]
+OPENAI_TTS_MODEL = os.environ.get("OPENAI_TTS_MODEL", "tts-1")
+OPENAI_TTS_VOICE = os.environ.get("OPENAI_TTS_VOICE", "onyx")  # Deep, authoritative
+# Fallback: play through Mac speakers when speaker fails or for testing
+ENABLE_LOCAL_PLAYBACK = os.environ.get("ENABLE_LOCAL_PLAYBACK", "").strip().lower() in ("1", "true", "yes")
+
 latest_transcript: str = ""
+latest_tts_audio: bytes = b""  # Served at /tts/latest.mp3 for play-from-URL mode
+
+# Base URL for TTS (speaker must reach this). Set to your Mac's IP, e.g. http://192.168.10.50:8000
+TTS_PUBLIC_URL = (os.environ.get("TTS_PUBLIC_URL") or "").rstrip("/")
+# Optional: test with a public MP3 URL to verify speaker can play streams (e.g. https://...)
+SPEAKER_TEST_URL = (os.environ.get("SPEAKER_TEST_URL") or "").strip() or None
 
 # Whisper hallucination phrases to ignore (case-insensitive substring match)
 # Comprehensive list of common Whisper video-outro / non-speech hallucinations
@@ -200,6 +228,163 @@ def _print_audio(msg: str) -> None:
     print(msg, flush=True)
 
 
+def _mp3_to_pcm(mp3_bytes: bytes, sample_rate: int = 16000) -> bytes | None:
+    """Convert MP3 bytes to raw PCM (16-bit signed, mono) for WebSocket playback."""
+    try:
+        from pydub import AudioSegment
+        seg = AudioSegment.from_mp3(io.BytesIO(mp3_bytes))
+        seg = seg.set_frame_rate(sample_rate).set_channels(1)
+        return seg.raw_data
+    except Exception as e:
+        logger.warning("MP3 to PCM conversion failed (install ffmpeg?): %s", e)
+        return None
+
+
+async def _speak_through_speaker(text: str) -> None:
+    """Generate TTS and play through IP speaker. Runs in thread to avoid blocking."""
+    if not ENABLE_SPEAKER_TTS or not SPEAKER_URL or not OPENAI_STT_API_KEY:
+        return
+    if not text or len(text) > 500:
+        return
+    try:
+        _print_audio("[Rioc] Generating speech...")
+        def _tts():
+            client = OpenAI(api_key=OPENAI_STT_API_KEY)
+            resp = client.audio.speech.create(
+                model=OPENAI_TTS_MODEL,
+                voice=OPENAI_TTS_VOICE,
+                input=text[:500],
+            )
+            return resp.content
+
+        audio_bytes = await asyncio.to_thread(_tts)
+        if not audio_bytes:
+            _print_audio("[Rioc] TTS returned no audio")
+            return
+        global latest_tts_audio
+        latest_tts_audio = audio_bytes
+        auth = (SPEAKER_USER, SPEAKER_PASS) if SPEAKER_USER else None
+        played = False
+        # Try WebSocket first (dashboard test uses wss://.../webtwowayaudio)
+        if SPEAKER_WS_URL and not played:
+            try:
+                import ssl
+                import websockets
+                _print_audio(f"[Rioc] Trying WebSocket: {SPEAKER_WS_URL}")
+                ssl_ctx = None
+                if SPEAKER_WS_URL.startswith("wss"):
+                    ssl_ctx = ssl.create_default_context()
+                    ssl_ctx.check_hostname = False
+                    ssl_ctx.verify_mode = ssl.CERT_NONE
+                async with websockets.connect(
+                    SPEAKER_WS_URL,
+                    close_timeout=5,
+                    open_timeout=10,
+                    ping_timeout=None,
+                    ssl=ssl_ctx,
+                ) as ws:
+                    # Speaker expects raw PCM (16-bit mono), not MP3 - MP3 sounds like static
+                    pcm_bytes = _mp3_to_pcm(audio_bytes, sample_rate=16000)
+                    if pcm_bytes:
+                        await ws.send(pcm_bytes)
+                        _print_audio("[Rioc] Speaker OK (WebSocket)")
+                        played = True
+                    else:
+                        _print_audio("[Rioc] WebSocket: PCM conversion failed")
+            except Exception as e:
+                _print_audio(f"[Rioc] WebSocket error: {e}")
+        if (TTS_PUBLIC_URL or SPEAKER_TEST_URL) and not played:
+            # Prefer test URL for diagnostics (can the speaker play ANY stream?)
+            audio_url = (SPEAKER_TEST_URL or f"{TTS_PUBLIC_URL}/tts/latest.mp3")
+            _print_audio(f"[Rioc] Playing stream: {audio_url}")
+            try:
+                async with httpx.AsyncClient(verify=False) as client:
+                    r = await client.get(
+                        f"{SPEAKER_URL}/api/play",
+                        params={
+                            "action": "startstream",
+                            "stream": audio_url,
+                            "volume": 20,  # 0-100, per dashboard examples
+                        },
+                        auth=auth,
+                        timeout=15.0,
+                    )
+                if r.status_code < 400:
+                    _print_audio("[Rioc] Speaker OK (startstream)")
+                    played = True
+                else:
+                    _print_audio(f"[Rioc] startstream: {r.status_code} {r.text[:80]}")
+            except Exception as e:
+                _print_audio(f"[Rioc] startstream error: {e}")
+        if not played:
+            # Try upload-then-play (dashboard shows file=userfile1 for uploaded files)
+            upload_paths = ["/api/upload", "/api/file/upload", "/upload", "/api/media/upload"]
+            for up_path in upload_paths:
+                try:
+                    async with httpx.AsyncClient(verify=False) as client:
+                        r = await client.post(
+                            f"{SPEAKER_URL}{up_path}",
+                            files={"file": ("tts.mp3", audio_bytes, "audio/mpeg")},
+                            auth=auth,
+                            timeout=30.0,
+                        )
+                    if r.status_code < 400:
+                        _print_audio(f"[Rioc] Upload OK ({up_path}), playing userfile1...")
+                        async with httpx.AsyncClient(verify=False) as client:
+                            r2 = await client.get(
+                                f"{SPEAKER_URL}/api/play",
+                                params={"action": "start", "file": "userfile1", "volume": 20},
+                                auth=auth,
+                                timeout=10.0,
+                            )
+                        if r2.status_code < 400:
+                            _print_audio("[Rioc] Speaker OK (upload+play)")
+                            played = True
+                            break
+                except Exception as e:
+                    pass  # Try next path
+        if not played:
+            paths_to_try = [SPEAKER_PLAY_PATH] + [p for p in SPEAKER_PLAY_FALLBACK_PATHS if p != SPEAKER_PLAY_PATH]
+            last_err = ""
+            for path in paths_to_try:
+                play_url = f"{SPEAKER_URL}{path}"
+                _print_audio(f"[Rioc] Trying speaker at {play_url}...")
+                try:
+                    async with httpx.AsyncClient(verify=False) as client:
+                        r = await client.post(
+                            play_url,
+                            content=audio_bytes,
+                            headers={"Content-Type": "audio/mpeg"},
+                            auth=auth,
+                            timeout=30.0,
+                        )
+                    if r.status_code < 400:
+                        _print_audio("[Rioc] Speaker OK")
+                        played = True
+                        break
+                    last_err = f"{r.status_code} {r.text[:100]}"
+                except Exception as e:
+                    last_err = str(e)
+            if not played:
+                _print_audio(f"[Rioc] Speaker failed (all paths): {last_err}")
+        if not played and ENABLE_LOCAL_PLAYBACK:
+            _play_audio_locally(audio_bytes)
+    except Exception as e:
+        _print_audio(f"[Rioc] TTS/speaker error: {e}")
+
+
+def _play_audio_locally(audio_bytes: bytes) -> None:
+    """Play MP3 through Mac speakers via afplay (fallback when IP speaker fails)."""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            f.write(audio_bytes)
+            path = f.name
+        os.system(f'afplay "{path}" 2>/dev/null')
+        os.unlink(path)
+    except Exception as e:
+        logger.debug("Local playback failed: %s", e)
+
+
 async def audio_transcription_loop() -> None:
     """Background task: capture audio, send to OpenAI STT, update latest_transcript."""
     global latest_transcript
@@ -254,6 +439,7 @@ async def audio_transcription_loop() -> None:
                         reply = (r.json().get("message") or {}).get("content") or ""
                         if reply.strip():
                             _print_audio(f"[Rioc] {reply.strip()}")
+                            asyncio.create_task(_speak_through_speaker(reply.strip()))
                     except Exception as e:
                         logger.debug("Audio response failed: %s", e)
             elif text and _is_stt_hallucination(text):
@@ -300,6 +486,7 @@ async def local_audit_loop() -> None:
             msg = (data.get("message") or {}).get("content") or ""
             if msg.strip():
                 print(f"[Visual Audit] {msg.strip()}")
+                asyncio.create_task(_speak_through_speaker(msg.strip()))
             else:
                 print("[Visual Audit] (model returned empty — ensure Ollama has openbmb/minicpm-v2.6 loaded)")
         except Exception as e:
@@ -332,6 +519,8 @@ async def lifespan(app: FastAPI):
                 "  OPENAI_STT_API_KEY=sk-proj-your-key\n"
                 f"  (Project root: {_project_dir})"
             )
+    if ENABLE_SPEAKER_TTS and SPEAKER_URL:
+        _print_audio(f"[Rioc] Speaker TTS enabled: {SPEAKER_URL}")
     try:
         yield
     finally:
@@ -390,3 +579,63 @@ async def video():
 async def transcript():
     """Return the latest audio transcript (if any)."""
     return {"text": latest_transcript}
+
+
+@app.get("/tts/latest.mp3")
+async def tts_latest():
+    """Serve latest TTS audio for play-from-URL (speaker fetches this)."""
+    if not latest_tts_audio:
+        return Response(content=b"", status_code=404, media_type="audio/mpeg")
+    return Response(content=latest_tts_audio, media_type="audio/mpeg")
+
+
+@app.get("/speaker-test")
+async def speaker_test():
+    """
+    Diagnostic: test if the speaker can reach this server.
+    Open this URL from a browser ON THE SAME NETWORK AS THE SPEAKER (e.g. your phone on WiFi).
+    If you hear audio, the speaker should be able to fetch it too.
+    """
+    if not latest_tts_audio:
+        return Response(
+            content="No TTS yet. Speak to Rioc first to generate speech.",
+            status_code=404,
+            media_type="text/plain",
+        )
+    return Response(content=latest_tts_audio, media_type="audio/mpeg")
+
+
+@app.get("/speaker-diagnostic")
+async def speaker_diagnostic():
+    """Return diagnostic steps when startstream returns 200 but no audio plays."""
+    tts_url = f"{TTS_PUBLIC_URL}/tts/latest.mp3" if TTS_PUBLIC_URL else "(set TTS_PUBLIC_URL)"
+    return {
+        "issue": "Speaker returns 200 but no audio - usually the speaker cannot reach your Mac",
+        "tts_url": tts_url,
+        "steps": [
+            "1. From your PHONE (same WiFi as speaker), open the tts_url above. Can you hear it?",
+            "2. If NO: Mac firewall may block port 8000. System Settings > Network > Firewall > allow Python or add port 8000.",
+            "3. If YES: Speaker may not support outbound HTTP. Check speaker web UI for 'Stream' or 'Network' settings.",
+            "4. Try SPEAKER_TEST_URL: set to a public MP3 (e.g. https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3) in .env, restart. If speaker plays it, the issue is Mac reachability.",
+        ],
+    }
+
+
+@app.get("/speaker-test-bell")
+async def speaker_test_bell():
+    """
+    Trigger the speaker's built-in bell (bell1). If you hear it, the speaker works
+    and the issue is with stream/URL playback. If you don't hear it, check volume/output.
+    """
+    auth = (SPEAKER_USER, SPEAKER_PASS) if SPEAKER_USER else None
+    try:
+        async with httpx.AsyncClient(verify=False) as client:
+            r = await client.get(
+                f"{SPEAKER_URL}/api/play",
+                params={"action": "start", "file": "bell1", "volume": 30},
+                auth=auth,
+                timeout=10.0,
+            )
+        return {"status": r.status_code, "message": "Triggered bell1. Did you hear it?"}
+    except Exception as e:
+        return {"status": 500, "message": str(e)}

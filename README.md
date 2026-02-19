@@ -49,6 +49,29 @@ The app will capture microphone audio, send it to OpenAI’s STT (`whisper-1` by
 
 Optional env: `OLLAMA_URL` (default `http://localhost:11434`), `OLLAMA_VISION_MODEL` (default `openbmb/minicpm-v2.6`), `AUDIT_INTERVAL_SEC` (default `5.0`), `ENABLE_AUDIO_STT` (enable/disable), `OPENAI_STT_MODEL` (default `whisper-1`), `STT_SAMPLE_RATE`, `STT_DURATION_SEC`, `STT_GAP_SEC`.
 
+**Optional: Speaker TTS** — Rioc speaks through an IP speaker:
+
+Add to `.env`: `SPEAKER_URL`, `SPEAKER_USER`, `SPEAKER_PASS`. Then:
+
+```bash
+ENABLE_SPEAKER_TTS=1 ENABLE_LOCAL_AUDIT=1 ENABLE_AUDIO_STT=1 uvicorn webcam_stream:app --host 0.0.0.0 --port 8000
+```
+
+Rioc’s responses (to speech and Visual Audit) are converted to speech via OpenAI TTS and POSTed to the speaker. The play endpoint defaults to `SPEAKER_PLAY_PATH=/play`; if your device uses a different path, set `SPEAKER_PLAY_PATH` in `.env`.
+
+**Speaker returns 200 but no sound?** Check the device dashboard: **Audio** (volume, output enabled) and **Media File** (some speakers require upload-then-play by index).
+
+**Speaker can't reach your Mac (firewall)?** Use **Cloudflare Tunnel** (no interstitial; ngrok free tier blocks API clients):
+
+1. Install cloudflared: `brew install cloudflared`
+2. In one terminal, run the app: `uvicorn webcam_stream:app --host 0.0.0.0 --port 8000`
+3. In another terminal: `cloudflared tunnel --url http://localhost:8000`
+4. Copy the HTTPS URL (e.g. `https://xxx-xxx-xxx.trycloudflare.com`)
+5. In `.env`, set: `TTS_PUBLIC_URL=https://xxx-xxx-xxx.trycloudflare.com`
+6. Restart the app. The speaker will fetch TTS from the tunnel (no firewall changes needed).
+
+   **Note:** Quick tunnel URLs change when you restart cloudflared—update `TTS_PUBLIC_URL` each time.
+
 ### Vision test (Rioc)
 
 Capture frames and send them to Ollama with the Rioc persona:
