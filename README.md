@@ -6,6 +6,7 @@ Webcam streaming over HTTP and an Ollama vision test (Rioc persona).
 
 - Python 3.x
 - Camera (default index 0)
+- **ffmpeg** (for Speaker TTS: `brew install ffmpeg`)
 - For **vision_test**: local [Ollama](https://ollama.ai) with `llama3.2-vision` (e.g. `ollama run llama3.2-vision`)
 
 ## Install
@@ -57,11 +58,10 @@ Add to `.env`: `SPEAKER_URL`, `SPEAKER_USER`, `SPEAKER_PASS`. Then:
 ENABLE_SPEAKER_TTS=1 ENABLE_LOCAL_AUDIT=1 ENABLE_AUDIO_STT=1 uvicorn webcam_stream:app --host 0.0.0.0 --port 8000
 ```
 
-Rioc’s responses (to speech and Visual Audit) are converted to speech via OpenAI TTS and POSTed to the speaker. The play endpoint defaults to `SPEAKER_PLAY_PATH=/play`; if your device uses a different path, set `SPEAKER_PLAY_PATH` in `.env`.
+Rioc’s responses (to speech and Visual Audit) are converted to speech via OpenAI TTS and sent to the speaker. 
+**Fanvil LINKVIL CS20 (and similar)** — Uses WebSocket at `wss://<speaker-ip>:8000/webtwowayaudio`. Add `SPEAKER_WS_URL=wss://192.168.10.183:8000/webtwowayaudio` to `.env`. The app streams TTS as **G.711 μ-law at 8 kHz** (same format as the dashboard's talk test). Requires **ffmpeg**: `brew install ffmpeg`.
 
-**Speaker returns 200 but no sound?** Check the device dashboard: **Audio** (volume, output enabled) and **Media File** (some speakers require upload-then-play by index).
-
-**Speaker can't reach your Mac (firewall)?** Use **Cloudflare Tunnel** (no interstitial; ngrok free tier blocks API clients):
+**Other speakers / Speaker can't reach your Mac (firewall)?** Use **Cloudflare Tunnel** (no interstitial; ngrok free tier blocks API clients):
 
 1. Install cloudflared: `brew install cloudflared`
 2. In one terminal, run the app: `uvicorn webcam_stream:app --host 0.0.0.0 --port 8000`

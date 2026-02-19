@@ -17,6 +17,7 @@ import base64
 import io
 import logging
 import os
+import subprocess
 import tempfile
 import wave
 from contextlib import asynccontextmanager
@@ -73,6 +74,8 @@ OPENAI_TTS_MODEL = os.environ.get("OPENAI_TTS_MODEL", "tts-1")
 OPENAI_TTS_VOICE = os.environ.get("OPENAI_TTS_VOICE", "onyx")  # Deep, authoritative
 # Fallback: play through Mac speakers when speaker fails or for testing
 ENABLE_LOCAL_PLAYBACK = os.environ.get("ENABLE_LOCAL_PLAYBACK", "").strip().lower() in ("1", "true", "yes")
+# WebSocket: G.711 μ-law at 8kHz (per talk.js)
+SPEAKER_WS_SAMPLE_RATE = int(os.environ.get("SPEAKER_WS_SAMPLE_RATE", "8000"))
 
 latest_transcript: str = ""
 latest_tts_audio: bytes = b""  # Served at /tts/latest.mp3 for play-from-URL mode
@@ -228,16 +231,26 @@ def _print_audio(msg: str) -> None:
     print(msg, flush=True)
 
 
-def _mp3_to_pcm(mp3_bytes: bytes, sample_rate: int = 16000) -> bytes | None:
-    """Convert MP3 bytes to raw PCM (16-bit signed, mono) for WebSocket playback."""
+def _mp3_to_mulaw(mp3_bytes: bytes, sample_rate: int = 8000) -> bytes | None:
+    """Convert MP3 to G.711 μ-law at 8kHz - format talk.js sends to speaker."""
     try:
-        from pydub import AudioSegment
-        seg = AudioSegment.from_mp3(io.BytesIO(mp3_bytes))
-        seg = seg.set_frame_rate(sample_rate).set_channels(1)
-        return seg.raw_data
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", "pipe:0",
+                "-f", "mulaw", "-ar", str(sample_rate), "-ac", "1",
+                "pipe:1",
+            ],
+            input=mp3_bytes,
+            capture_output=True,
+            timeout=30,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            return proc.stdout
+    except FileNotFoundError:
+        logger.warning("ffmpeg not found. Install with: brew install ffmpeg")
     except Exception as e:
-        logger.warning("MP3 to PCM conversion failed (install ffmpeg?): %s", e)
-        return None
+        logger.warning("MP3 to μ-law conversion failed: %s", e)
+    return None
 
 
 async def _speak_through_speaker(text: str) -> None:
@@ -283,14 +296,18 @@ async def _speak_through_speaker(text: str) -> None:
                     ping_timeout=None,
                     ssl=ssl_ctx,
                 ) as ws:
-                    # Speaker expects raw PCM (16-bit mono), not MP3 - MP3 sounds like static
-                    pcm_bytes = _mp3_to_pcm(audio_bytes, sample_rate=16000)
-                    if pcm_bytes:
-                        await ws.send(pcm_bytes)
-                        _print_audio("[Rioc] Speaker OK (WebSocket)")
+                    # Speaker expects G.711 μ-law at 8kHz (per talk.js: mulawEncode → send)
+                    mulaw_bytes = _mp3_to_mulaw(audio_bytes, sample_rate=SPEAKER_WS_SAMPLE_RATE)
+                    if mulaw_bytes:
+                        # Send in ~20ms chunks (160 bytes at 8kHz) - matches talk.js buffer flow
+                        chunk_size = (SPEAKER_WS_SAMPLE_RATE // 50)  # 160 bytes
+                        for i in range(0, len(mulaw_bytes), chunk_size):
+                            await ws.send(mulaw_bytes[i : i + chunk_size])
+                            await asyncio.sleep(0.02)
+                        _print_audio("[Rioc] Speaker OK (WebSocket μ-law)")
                         played = True
                     else:
-                        _print_audio("[Rioc] WebSocket: PCM conversion failed")
+                        _print_audio("[Rioc] WebSocket: μ-law conversion failed")
             except Exception as e:
                 _print_audio(f"[Rioc] WebSocket error: {e}")
         if (TTS_PUBLIC_URL or SPEAKER_TEST_URL) and not played:
