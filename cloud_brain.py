@@ -32,20 +32,25 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "openbmb/MiniCPM-V-2_6-int4")
 AUDIT_INTERVAL_SEC = float(os.environ.get("AUDIT_INTERVAL_SEC", "5.0"))
 
 SYSTEM_PROMPT = (
-    "You are the Rioc Sentinel, an automated audio-broadcast security system. Do not use labels like 'Visual Data' or 'Warning'. Do not use headers or bullet points. Speak only the final warning text as it should be heard over a loudspeaker. Be cold, concise, and observational. Do not identify as an AI. "
-    "Only describe clothing or details you can clearly see in the image. If uncertain, use 'person' or 'you there'—never guess or invent details."
+    "You are the Rioc Sentinel, an automated audio-broadcast security system. Do not use labels like 'Visual Data' or 'Warning'. Do not use headers or bullet points. Speak only the final warning text as it should be heard over a loudspeaker. Be cold, concise, and observational. Do not identify as an AI."
 )
 USER_PROMPT = (
-    """Start by addressing the person. If you clearly see specific clothing (e.g. red jacket, dark shirt), use it. Otherwise say "You there" or "Person in frame".
+    """Start by immediately identifying the person—describe their clothing, hair, or what they're doing (e.g., 'You in the red jacket', 'You with the dark shirt', 'You by the door'). This shows them we can see them.
 
 State that the area is restricted and an on-site response is triggered.
 
-If they spoke or moved, acknowledge it directly.
+IMPORTANT: Output the raw speech only. No labels. No 'Protocol Start'. No 'Proceed with broadcast'."""
+)
+USER_PROMPT_WITH_SPEECH = (
+    """Start by immediately identifying the person—describe their clothing, hair, or what they're doing. This shows them we can see them.
 
-If they are returning, state that their identity is confirmed and escalation is active.
+The person just said: "{transcript}"
+
+Respond directly to what they said in a natural, conversational way. Address their question, objection, or excuse. Do not say "I heard you"—engage with the content. Then state that the area is restricted and an on-site response is triggered.
 
 IMPORTANT: Output the raw speech only. No labels. No 'Protocol Start'. No 'Proceed with broadcast'."""
 )
+MIN_TRANSCRIPT_LEN = 15  # Only use transcript when it's substantial (avoids noise, stale fragments)
 
 BOUNDARY = b"frame"
 HEADER_END = b"\r\n\r\n"
@@ -119,12 +124,8 @@ def run_visual_audit(
 ) -> str:
     """Send one frame (and optional transcript) to the model; return the assistant reply."""
     b64 = base64.standard_b64encode(jpeg_bytes).decode("ascii")
-    text = USER_PROMPT
-    if transcript:
-        text += (
-            f'\n\nThe person is saying: "{transcript}". '
-            "Combine what you see and hear in your tactical warning."
-        )
+    use_speech = transcript and len(transcript.strip()) >= MIN_TRANSCRIPT_LEN
+    text = USER_PROMPT_WITH_SPEECH.format(transcript=transcript) if use_speech else USER_PROMPT
     # MiniCPM expects text first, then image (per vLLM docs)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
