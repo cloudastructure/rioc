@@ -1,0 +1,5 @@
+# Minimal deps for cloud_brain.py (run on AWS)
+# vLLM is installed separately on the EC2 instance
+httpx>=0.25.0
+openai>=1.0.0
+python-dotenv>=1.0.0

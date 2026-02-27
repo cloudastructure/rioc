@@ -84,7 +84,7 @@ python vision_test.py
 
 ### Cloud Brain (Visual Audit on AWS)
 
-**cloud_brain.py** is intended to run on **AWS**. It pulls frames from the Mac’s MJPEG stream and sends them to vLLM (MiniCPM-V-2_6) via an OpenAI-compatible API for a “Visual Audit.”
+**cloud_brain.py** runs on **AWS**. See **[DEPLOY_AWS.md](DEPLOY_AWS.md)** for the full deployment guide. It pulls frames from the Mac’s MJPEG stream and sends them to vLLM (MiniCPM-V-2_6) via an OpenAI-compatible API for a “Visual Audit.”
 
 **Requirements:**
 
@@ -105,8 +105,7 @@ python vision_test.py
 **Run:**
 
 ```bash
-# On AWS (Mac IP and vLLM host set for your environment)
-export MAC_IP=192.168.1.100
-export VLLM_BASE_URL=http://vllm-host:8000/v1
+# On AWS EC2 (after vLLM is running, .env has STREAM_URL and OPENAI_API_KEY)
+pip install -r requirements-cloud_brain.txt
 python cloud_brain.py
 ```
