@@ -1,0 +1,9 @@
+# MediaMTX config for Rioc VideoDB RTSP streams.
+# Run: mediamtx mediamtx.yml
+# Then publish: ffmpeg ... rtmp://localhost:1935/cam
+
+paths:
+  cam:
+    source: publisher
+  mic:
+    source: publisher
