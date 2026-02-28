@@ -62,6 +62,8 @@ STT_SAMPLE_RATE = int(os.environ.get("STT_SAMPLE_RATE", "16000"))
 STT_DURATION_SEC = float(os.environ.get("STT_DURATION_SEC", "5.0"))
 STT_GAP_SEC = float(os.environ.get("STT_GAP_SEC", "0.0"))
 STT_SILENCE_THRESHOLD = float(os.environ.get("STT_SILENCE_THRESHOLD", "300"))  # RMS below this = skip STT
+# Audio input device: index (e.g. 1) or name substring (e.g. Fanvil, LINKVIL, CS20). Use external speaker mic when set.
+AUDIO_INPUT_DEVICE = (os.environ.get("AUDIO_INPUT_DEVICE") or "").strip() or None
 
 # Optional VideoDB eyes and ears (real-time transcript + visual/audio indexing)
 # Docs: https://docs.videodb.io/pages/getting-started/quickstart
@@ -219,11 +221,33 @@ async def video_stream_generator():
         yield header + jpeg_bytes
 
 
-def _record_audio_chunk() -> bytes | None:
-    """Record STT_DURATION_SEC of mono audio from the default mic, return WAV bytes."""
+def _resolve_audio_input_device() -> int | None:
+    """Resolve AUDIO_INPUT_DEVICE to a sounddevice index. Returns None for default device."""
+    if not AUDIO_INPUT_DEVICE:
+        return None
     try:
+        # If it's a numeric string, use as index
+        return int(AUDIO_INPUT_DEVICE)
+    except ValueError:
+        pass
+    # Search by name (e.g. Fanvil, LINKVIL, CS20)
+    name_lower = AUDIO_INPUT_DEVICE.lower()
+    for i, dev in enumerate(sd.query_devices()):
+        if dev["max_input_channels"] > 0 and name_lower in (dev.get("name") or "").lower():
+            return i
+    logger.warning("AUDIO_INPUT_DEVICE=%r: no matching input device found, using default", AUDIO_INPUT_DEVICE)
+    return None
+
+
+def _record_audio_chunk() -> bytes | None:
+    """Record STT_DURATION_SEC of mono audio from the configured mic, return WAV bytes."""
+    try:
+        device = _resolve_audio_input_device()
         n_samples = int(STT_SAMPLE_RATE * STT_DURATION_SEC)
-        audio = sd.rec(n_samples, samplerate=STT_SAMPLE_RATE, channels=1, dtype="int16")
+        rec_kw = {"samplerate": STT_SAMPLE_RATE, "channels": 1, "dtype": "int16"}
+        if device is not None:
+            rec_kw["device"] = device
+        audio = sd.rec(n_samples, **rec_kw)
         sd.wait()
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
@@ -420,7 +444,13 @@ async def audio_transcription_loop() -> None:
     if not OPENAI_STT_API_KEY:
         _print_audio("[Rioc] Audio STT disabled: no OPENAI_STT_API_KEY or OPENAI_API_KEY in .env")
         return
-    _print_audio("[Rioc] Audio loop started. Recording 5s chunks, then sending to STT...")
+    dev_info = ""
+    if AUDIO_INPUT_DEVICE:
+        idx = _resolve_audio_input_device()
+        if idx is not None:
+            dev = sd.query_devices(idx)
+            dev_info = f" (input: {dev.get('name', '?')})"
+    _print_audio(f"[Rioc] Audio loop started{dev_info}. Recording {STT_DURATION_SEC}s chunks, then sending to STT...")
     url = "https://api.openai.com/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {OPENAI_STT_API_KEY}"}
     while True:

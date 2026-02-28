@@ -53,6 +53,8 @@ async def run_videodb_eyes(
     video_url = VIDEODB_RTSP_VIDEO or DEMO_VIDEO_URL
     audio_url = VIDEODB_RTSP_AUDIO or DEMO_AUDIO_URL
 
+    logger.info("VideoDB starting: video=%s audio=%s", video_url[:50] + "..." if len(video_url) > 50 else video_url, audio_url[:50] + "..." if len(audio_url) > 50 else audio_url)
+
     if not VIDEODB_RTSP_VIDEO and not VIDEODB_RTSP_AUDIO:
         logger.info(
             "VideoDB using demo streams (matrix.videodb.io). "
@@ -65,34 +67,41 @@ async def run_videodb_eyes(
         logger.error("VideoDB not installed. Run: pip install videodb")
         return
 
+    logger.info("VideoDB connecting...")
     conn = videodb.connect(api_key=VIDEODB_API_KEY)
     coll = conn.get_collection()
     ws = conn.connect_websocket()
     await ws.connect()
+    logger.info("VideoDB WebSocket connected, connecting RTSP streams...")
 
-    audio_stream = coll.connect_rtstream(
+    # connect_rtstream can block; run in thread to avoid blocking event loop
+    audio_stream = await asyncio.to_thread(
+        coll.connect_rtstream,
         url=audio_url,
         name="Rioc Audio",
         media_types=["audio"],
     )
-    video_stream = coll.connect_rtstream(
+    video_stream = await asyncio.to_thread(
+        coll.connect_rtstream,
         url=video_url,
         name="Rioc Video",
         media_types=["video"],
     )
 
-    audio_stream.start_transcript(ws_connection_id=ws.connection_id)
-    audio_stream.index_audio(
-        prompt=AUDIO_INDEX_PROMPT,
-        batch_config={"type": "time", "value": batch_seconds},
-        ws_connection_id=ws.connection_id,
-    )
-    video_stream.index_visuals(
-        prompt=VIDEO_INDEX_PROMPT,
-        batch_config={"type": "time", "value": batch_seconds, "frame_count": 1},
-        ws_connection_id=ws.connection_id,
-    )
+    def _start_pipelines() -> None:
+        audio_stream.start_transcript(ws_connection_id=ws.connection_id)
+        audio_stream.index_audio(
+            prompt=AUDIO_INDEX_PROMPT,
+            batch_config={"type": "time", "value": batch_seconds},
+            ws_connection_id=ws.connection_id,
+        )
+        video_stream.index_visuals(
+            prompt=VIDEO_INDEX_PROMPT,
+            batch_config={"type": "time", "value": batch_seconds, "frame_count": 1},
+            ws_connection_id=ws.connection_id,
+        )
 
+    await asyncio.to_thread(_start_pipelines)
     logger.info("VideoDB eyes and ears active (transcript + visual/audio index)")
 
     try:

@@ -56,7 +56,7 @@ Optional env: `OLLAMA_URL` (default `http://localhost:11434`), `OLLAMA_VISION_MO
 ENABLE_VIDEODB=1 VIDEODB_API_KEY=your-key uvicorn webcam_stream:app --host 0.0.0.0 --port 8000
 ```
 
-With no RTSP URLs set, Rioc uses VideoDB's demo streams so you can try it immediately. For your own webcam/mic, run MediaMTX + FFmpeg to create RTSP streams, expose them (e.g. via ngrok), then set `VIDEODB_RTSP_VIDEO` and `VIDEODB_RTSP_AUDIO` in `.env`.
+With no RTSP URLs set, Rioc uses VideoDB's demo streams so you can try it immediately. For your own webcam/mic: run `mediamtx mediamtx.yml` (the config defines `cam` and `mic` paths), then FFmpeg to publish, ngrok TCP to expose, and set `VIDEODB_RTSP_VIDEO` / `VIDEODB_RTSP_AUDIO` in `.env`. See `scripts/videodb_rtsp.sh`.
 
 **Optional: Speaker TTS** — Rioc speaks through an IP speaker:
 
@@ -68,6 +68,8 @@ ENABLE_SPEAKER_TTS=1 ENABLE_LOCAL_AUDIT=1 ENABLE_AUDIO_STT=1 uvicorn webcam_stre
 
 Rioc’s responses (to speech and Visual Audit) are converted to speech via OpenAI TTS and sent to the speaker. 
 **Fanvil LINKVIL CS20 (and similar)** — Uses WebSocket at `wss://<speaker-ip>:8000/webtwowayaudio`. Add `SPEAKER_WS_URL=wss://192.168.10.183:8000/webtwowayaudio` to `.env`. The app streams TTS as **G.711 μ-law at 8 kHz** (same format as the dashboard's talk test). Requires **ffmpeg**: `brew install ffmpeg`.
+
+**Use the speaker for both input and output** — When the Fanvil (or similar) is connected via USB, it appears as a Mac audio device. Set `AUDIO_INPUT_DEVICE=Fanvil` (or `AUDIO_INPUT_DEVICE=1` if it's the second input) in `.env` so Rioc listens through the speaker's mic instead of the Mac mic. For VideoDB's FFmpeg mic stream, use the numeric index: `AUDIO_INPUT_DEVICE=1` (find indices with `ffmpeg -f avfoundation -list_devices true -i ""`).
 
 **Other speakers / Speaker can't reach your Mac (firewall)?** Use **Cloudflare Tunnel** (no interstitial; ngrok free tier blocks API clients):
 
