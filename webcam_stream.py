@@ -63,6 +63,11 @@ STT_DURATION_SEC = float(os.environ.get("STT_DURATION_SEC", "5.0"))
 STT_GAP_SEC = float(os.environ.get("STT_GAP_SEC", "0.0"))
 STT_SILENCE_THRESHOLD = float(os.environ.get("STT_SILENCE_THRESHOLD", "300"))  # RMS below this = skip STT
 
+# Optional VideoDB eyes and ears (real-time transcript + visual/audio indexing)
+# Docs: https://docs.videodb.io/pages/getting-started/quickstart
+ENABLE_VIDEODB = os.environ.get("ENABLE_VIDEODB", "").strip().lower() in ("1", "true", "yes")
+VIDEODB_BATCH_SEC = int(os.environ.get("VIDEODB_BATCH_SEC", "5"))
+
 # Optional TTS + speaker output (Rioc speaks through IP speaker)
 ENABLE_SPEAKER_TTS = os.environ.get("ENABLE_SPEAKER_TTS", "").strip().lower() in ("1", "true", "yes")
 SPEAKER_URL = (os.environ.get("SPEAKER_URL") or "").rstrip("/")
@@ -519,14 +524,16 @@ async def local_audit_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Open camera on startup, release on shutdown. Optionally start local audit + audio STT tasks."""
-    global cap
+    """Open camera on startup, release on shutdown. Optionally start local audit + audio STT + VideoDB tasks."""
+    global cap, latest_transcript
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         logger.error("Failed to open camera (index 0)")
         cap = None
     audit_task = None
     audio_task = None
+    videodb_task = None
+
     if ENABLE_LOCAL_AUDIT and cap is not None:
         audit_task = asyncio.create_task(local_audit_loop())
         logger.info("Local Visual Audit enabled (model=%s, interval=%.1fs)", OLLAMA_VISION_MODEL, AUDIT_INTERVAL_SEC)
@@ -543,6 +550,27 @@ async def lifespan(app: FastAPI):
                 "  OPENAI_STT_API_KEY=sk-proj-your-key\n"
                 f"  (Project root: {_project_dir})"
             )
+    if ENABLE_VIDEODB:
+        from videodb_integration import run_videodb_eyes
+
+        def _on_transcript(t: str) -> None:
+            global latest_transcript
+            latest_transcript = t
+            _print_audio(f"[Rioc] VideoDB heard: {t}")
+
+        def _on_visual(t: str) -> None:
+            _print_audio(f"[VideoDB] Visual: {t}")
+            if ENABLE_SPEAKER_TTS and SPEAKER_URL and len(t) <= 500:
+                asyncio.create_task(_speak_through_speaker(t))
+
+        videodb_task = asyncio.create_task(
+            run_videodb_eyes(
+                on_transcript=_on_transcript,
+                on_visual_index=_on_visual,
+                batch_seconds=VIDEODB_BATCH_SEC,
+            )
+        )
+        logger.info("VideoDB eyes and ears enabled (batch=%ds)", VIDEODB_BATCH_SEC)
     if ENABLE_SPEAKER_TTS and SPEAKER_URL:
         _print_audio(f"[Rioc] Speaker TTS enabled: {SPEAKER_URL}")
     try:
@@ -558,6 +586,12 @@ async def lifespan(app: FastAPI):
             audio_task.cancel()
             try:
                 await audio_task
+            except asyncio.CancelledError:
+                pass
+        if videodb_task is not None:
+            videodb_task.cancel()
+            try:
+                await videodb_task
             except asyncio.CancelledError:
                 pass
         if cap is not None:

@@ -50,6 +50,14 @@ The app will capture microphone audio, send it to OpenAI’s STT (`whisper-1` by
 
 Optional env: `OLLAMA_URL` (default `http://localhost:11434`), `OLLAMA_VISION_MODEL` (default `openbmb/minicpm-v2.6`), `AUDIT_INTERVAL_SEC` (default `5.0`), `ENABLE_AUDIO_STT` (enable/disable), `OPENAI_STT_MODEL` (default `whisper-1`), `STT_SAMPLE_RATE`, `STT_DURATION_SEC`, `STT_GAP_SEC`.
 
+**Optional: VideoDB eyes and ears** — Use [VideoDB](https://docs.videodb.io/pages/getting-started/quickstart) for real-time transcript + visual/audio indexing:
+
+```bash
+ENABLE_VIDEODB=1 VIDEODB_API_KEY=your-key uvicorn webcam_stream:app --host 0.0.0.0 --port 8000
+```
+
+With no RTSP URLs set, Rioc uses VideoDB's demo streams so you can try it immediately. For your own webcam/mic, run MediaMTX + FFmpeg to create RTSP streams, expose them (e.g. via ngrok), then set `VIDEODB_RTSP_VIDEO` and `VIDEODB_RTSP_AUDIO` in `.env`.
+
 **Optional: Speaker TTS** — Rioc speaks through an IP speaker:
 
 Add to `.env`: `SPEAKER_URL`, `SPEAKER_USER`, `SPEAKER_PASS`. Then:
