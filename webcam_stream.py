@@ -28,8 +28,10 @@ import cv2
 import httpx
 import sounddevice as sd
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -631,6 +633,24 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Webcam Stream", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class TtsTestRequest(BaseModel):
+    text: str
+
+
+@app.post("/tts/test")
+async def tts_test(body: TtsTestRequest):
+    """Send arbitrary text to the speaker (used by the AI Guard UI)."""
+    await _speak_through_speaker(body.text)
+    return {"ok": True}
 
 
 @app.get("/", response_class=HTMLResponse)
