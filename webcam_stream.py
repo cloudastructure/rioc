@@ -653,6 +653,45 @@ async def tts_test(body: TtsTestRequest):
     return {"ok": True}
 
 
+class ConfigureRequest(BaseModel):
+    cameraRtspUrl: str | None = None
+    speakerUrl: str | None = None
+    speakerUser: str | None = None
+    speakerPass: str | None = None
+    speakerWsUrl: str | None = None
+
+
+@app.post("/configure")
+async def configure(body: ConfigureRequest):
+    """Hot-swap camera source and/or speaker settings without restarting."""
+    global cap, SPEAKER_URL, SPEAKER_USER, SPEAKER_PASS, SPEAKER_WS_URL
+
+    if body.cameraRtspUrl is not None:
+        if cap is not None:
+            cap.release()
+        cap = cv2.VideoCapture(body.cameraRtspUrl)
+        if not cap.isOpened():
+            cap = None
+            return Response(
+                content=f"Failed to open camera stream: {body.cameraRtspUrl}",
+                status_code=400,
+                media_type="text/plain",
+            )
+        logger.info("Camera reconfigured to: %s", body.cameraRtspUrl)
+
+    if body.speakerUrl is not None:
+        SPEAKER_URL = body.speakerUrl.rstrip("/")
+        logger.info("Speaker URL updated to: %s", SPEAKER_URL)
+    if body.speakerUser is not None:
+        SPEAKER_USER = body.speakerUser
+    if body.speakerPass is not None:
+        SPEAKER_PASS = body.speakerPass
+    if body.speakerWsUrl is not None:
+        SPEAKER_WS_URL = body.speakerWsUrl
+
+    return {"ok": True}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def root():
     """Simple page that embeds the MJPEG stream for testing."""
