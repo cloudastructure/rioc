@@ -23,6 +23,8 @@ import wave
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
+import re
+import threading
 import numpy as np
 import cv2
 import httpx
@@ -41,19 +43,23 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "openbmb/minicpm-v2.6")
 AUDIT_INTERVAL_SEC = float(os.environ.get("AUDIT_INTERVAL_SEC", "5.0"))
 
+# Optional cloud AI visual analysis (OpenAI-compatible vLLM server)
+ENABLE_CLOUD_AI = os.environ.get("ENABLE_CLOUD_AI", "").strip().lower() in ("1", "true", "yes")
+CLOUD_AI_URL = (os.environ.get("CLOUD_AI_URL") or "").rstrip("/")
+CLOUD_AI_API_KEY = os.environ.get("CLOUD_AI_API_KEY", "token-minicpm-v45")
+CLOUD_AI_MODEL = os.environ.get("CLOUD_AI_MODEL", "openbmb/MiniCPM-V-4_5")
+
 AUDIT_SYSTEM_PROMPT = (
     "You are the Rioc Sentinel, an automated audio-broadcast security system. Do not use labels like 'Visual Data' or 'Warning'. Do not use headers or bullet points. Speak only the final warning text as it should be heard over a loudspeaker. Be cold, concise, and observational. Do not identify as an AI."
 )
 AUDIT_USER_PROMPT = (
-    """Start by immediately addressing the person's specific clothing or actions (e.g., 'You in the red jacket, I see you').
+    """Examine this image carefully.
 
-State that the area is restricted and an on-site response is triggered.
+RULE 1: If no human person is clearly and actually visible in the image, output ONLY the single word CLEAR and nothing else. Do not invent or imagine a person.
 
-If they spoke or moved, acknowledge it directly.
+RULE 2: Only if a real human person is clearly visible, output a one-sentence security broadcast that directly addresses them by their clothing or position. Cold, observational tone. No headers, no labels.
 
-If they are returning, state that their identity is confirmed and escalation is active.
-
-IMPORTANT: Output the raw speech only. No labels. No 'Protocol Start'. No 'Proceed with broadcast'."""
+Output ONLY the word CLEAR or ONLY the one-sentence broadcast. Nothing else."""
 )
 
 # Optional audio transcription (cloud STT)
@@ -158,6 +164,17 @@ STT_HALLUCINATION_PHRASES = (
 STT_PROMPT = "A person is speaking to a security guard. Transcribe only their direct speech."
 
 
+def _strip_think_tags(text: str) -> str:
+    """Extract only the final response after <think>...</think> reasoning blocks."""
+    if "</think>" in text:
+        # Take everything after the last closing tag
+        return text.split("</think>")[-1].strip()
+    if "<think>" in text:
+        # Unclosed tag — model is still reasoning, no final output yet
+        return ""
+    return text.strip()
+
+
 def _is_stt_hallucination(text: str) -> bool:
     """Return True if transcript matches known Whisper hallucination phrases."""
     t = text.lower().strip()
@@ -181,6 +198,7 @@ def _is_audio_silent(wav_bytes: bytes) -> bool:
 
 # Global camera; set in lifespan, released on shutdown.
 cap: cv2.VideoCapture | None = None
+cap_lock = threading.Lock()  # Guards all reads/writes of cap
 
 FRAME_SIZE = (640, 640)
 JPEG_QUALITY = 70
@@ -189,10 +207,10 @@ CONSECUTIVE_READ_FAILURES_MAX = 30
 
 def get_next_frame() -> bytes | None:
     """Read one frame from the global camera; resize and encode as JPEG. Returns None on failure."""
-    global cap
-    if cap is None or not cap.isOpened():
-        return None
-    ret, frame = cap.read()
+    with cap_lock:
+        if cap is None or not cap.isOpened():
+            return None
+        ret, frame = cap.read()
     if not ret or frame is None:
         return None
     frame = cv2.resize(frame, FRAME_SIZE, interpolation=cv2.INTER_LINEAR)
@@ -475,23 +493,39 @@ async def audio_transcription_loop() -> None:
             if text and not _is_stt_hallucination(text):
                 latest_transcript = text
                 _print_audio(f"[Rioc] Heard: {text}")
-                # Get Rioc to respond directly to what was said (when Ollama is available)
-                if ENABLE_LOCAL_AUDIT:
+                # Get Rioc to respond directly to what was said
+                audio_prompt = (
+                    f"You are Rioc, a tactical guard. The person in front of you just said: \"{text}\". "
+                    "Respond directly to them in one sentence. Cold, authoritative tone. Do not repeat what they said."
+                )
+                if ENABLE_CLOUD_AI and CLOUD_AI_URL:
+                    try:
+                        async with httpx.AsyncClient() as client:
+                            r = await client.post(
+                                f"{CLOUD_AI_URL}/v1/chat/completions",
+                                headers={"Authorization": f"Bearer {CLOUD_AI_API_KEY}"},
+                                json={
+                                    "model": CLOUD_AI_MODEL,
+                                    "messages": [{"role": "user", "content": audio_prompt}],
+                                    "max_tokens": 100,
+                                },
+                                timeout=30.0,
+                            )
+                        r.raise_for_status()
+                        reply = _strip_think_tags(((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+                        if reply:
+                            _print_audio(f"[Rioc] {reply}")
+                            asyncio.create_task(_speak_through_speaker(reply))
+                    except Exception as e:
+                        logger.debug("Audio response (cloud) failed: %s", e)
+                elif ENABLE_LOCAL_AUDIT:
                     try:
                         async with httpx.AsyncClient() as client:
                             r = await client.post(
                                 f"{OLLAMA_URL.rstrip('/')}/api/chat",
                                 json={
                                     "model": OLLAMA_VISION_MODEL,
-                                    "messages": [
-                                        {
-                                            "role": "user",
-                                            "content": (
-                                                f"You are Rioc, a tactical guard. The person in front of you just said: \"{text}\". "
-                                                "Respond directly to them in one sentence. Cold, authoritative tone. Do not repeat what they said."
-                                            ),
-                                        },
-                                    ],
+                                    "messages": [{"role": "user", "content": audio_prompt}],
                                     "stream": False,
                                 },
                                 timeout=30.0,
@@ -502,7 +536,7 @@ async def audio_transcription_loop() -> None:
                             _print_audio(f"[Rioc] {reply.strip()}")
                             asyncio.create_task(_speak_through_speaker(reply.strip()))
                     except Exception as e:
-                        logger.debug("Audio response failed: %s", e)
+                        logger.debug("Audio response (local) failed: %s", e)
             elif text and _is_stt_hallucination(text):
                 pass  # Silently ignore Whisper hallucinations
             else:
@@ -554,6 +588,53 @@ async def local_audit_loop() -> None:
             print(f"[Visual Audit] Request failed: {e}")
 
 
+async def cloud_audit_loop() -> None:
+    """Background task: every AUDIT_INTERVAL_SEC, grab a frame and send to cloud vLLM for visual analysis."""
+    while True:
+        await asyncio.sleep(AUDIT_INTERVAL_SEC)
+        jpeg_bytes = await asyncio.to_thread(get_next_frame)
+        if not jpeg_bytes:
+            continue
+        b64 = base64.standard_b64encode(jpeg_bytes).decode("ascii")
+        context = AUDIT_USER_PROMPT
+        if latest_transcript:
+            context += (
+                f'\n\nThe person is saying: "{latest_transcript}". '
+                "Factor this audio into your tactical warning."
+            )
+        full_prompt = AUDIT_SYSTEM_PROMPT + "\n\n" + context
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{CLOUD_AI_URL}/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {CLOUD_AI_API_KEY}"},
+                    json={
+                        "model": CLOUD_AI_MODEL,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": full_prompt},
+                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                                ],
+                            }
+                        ],
+                        "max_tokens": 300,
+                    },
+                    timeout=60.0,
+                )
+            resp.raise_for_status()
+            msg = _strip_think_tags(((resp.json().get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+            first_line = msg.split('\n')[0].strip().upper()
+            if not msg or first_line == "CLEAR":
+                print("[Cloud AI] CLEAR — no person detected", flush=True)
+            else:
+                print(f"[Cloud AI] {msg}", flush=True)
+                asyncio.create_task(_speak_through_speaker(msg))
+        except Exception as e:
+            print(f"[Cloud AI] Request failed: {e}", flush=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Open camera on startup, release on shutdown. Optionally start local audit + audio STT + VideoDB tasks."""
@@ -563,8 +644,13 @@ async def lifespan(app: FastAPI):
         logger.error("Failed to open camera (index 0)")
         cap = None
     audit_task = None
+    cloud_audit_task = None
     audio_task = None
     videodb_task = None
+
+    if ENABLE_CLOUD_AI and CLOUD_AI_URL:
+        cloud_audit_task = asyncio.create_task(cloud_audit_loop())
+        logger.info("Cloud AI visual analysis enabled (model=%s, url=%s)", CLOUD_AI_MODEL, CLOUD_AI_URL)
 
     if ENABLE_LOCAL_AUDIT and cap is not None:
         audit_task = asyncio.create_task(local_audit_loop())
@@ -608,6 +694,12 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if cloud_audit_task is not None:
+            cloud_audit_task.cancel()
+            try:
+                await cloud_audit_task
+            except asyncio.CancelledError:
+                pass
         if audit_task is not None:
             audit_task.cancel()
             try:
@@ -626,9 +718,11 @@ async def lifespan(app: FastAPI):
                 await videodb_task
             except asyncio.CancelledError:
                 pass
-        if cap is not None:
-            cap.release()
+        with cap_lock:
+            old_cap = cap
             cap = None
+        if old_cap is not None:
+            old_cap.release()
             logger.info("Camera released.")
 
 
@@ -661,22 +755,70 @@ class ConfigureRequest(BaseModel):
     speakerWsUrl: str | None = None
 
 
+async def _probe_rtsp(url: str) -> bool:
+    """Use ffprobe (subprocess) to check if an RTSP URL is reachable before passing to OpenCV."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-rtsp_transport", "tcp", "-i", url,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return False
+        return proc.returncode == 0
+    except FileNotFoundError:
+        return True  # ffprobe not installed — let OpenCV try
+    except Exception:
+        return False
+
+
+def _open_capture(url: str) -> cv2.VideoCapture:
+    """Open a VideoCapture in a thread (only called after ffprobe confirms reachability)."""
+    return cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+
+
 @app.post("/configure")
 async def configure(body: ConfigureRequest):
     """Hot-swap camera source and/or speaker settings without restarting."""
     global cap, SPEAKER_URL, SPEAKER_USER, SPEAKER_PASS, SPEAKER_WS_URL
 
     if body.cameraRtspUrl is not None:
-        if cap is not None:
-            cap.release()
-        cap = cv2.VideoCapture(body.cameraRtspUrl)
-        if not cap.isOpened():
-            cap = None
+        # Use ffprobe to validate before touching OpenCV (prevents macOS segfault on bad RTSP)
+        reachable = await _probe_rtsp(body.cameraRtspUrl)
+        if not reachable:
+            return Response(
+                content=f"Camera stream unreachable: {body.cameraRtspUrl}",
+                status_code=400,
+                media_type="text/plain",
+            )
+        try:
+            new_cap = await asyncio.wait_for(
+                asyncio.to_thread(_open_capture, body.cameraRtspUrl),
+                timeout=12.0,
+            )
+        except asyncio.TimeoutError:
+            return Response(
+                content=f"Camera stream timed out: {body.cameraRtspUrl}",
+                status_code=400,
+                media_type="text/plain",
+            )
+        if not new_cap.isOpened():
+            new_cap.release()
             return Response(
                 content=f"Failed to open camera stream: {body.cameraRtspUrl}",
                 status_code=400,
                 media_type="text/plain",
             )
+        # Swap cap under lock so get_next_frame can't read a partially-released cap
+        with cap_lock:
+            old_cap = cap
+            cap = new_cap
+        if old_cap is not None:
+            old_cap.release()
         logger.info("Camera reconfigured to: %s", body.cameraRtspUrl)
 
     if body.speakerUrl is not None:
