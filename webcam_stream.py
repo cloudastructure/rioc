@@ -23,8 +23,10 @@ import wave
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
+import datetime
 import re
 import threading
+from collections import deque
 import numpy as np
 import cv2
 import httpx
@@ -53,13 +55,13 @@ AUDIT_SYSTEM_PROMPT = (
     "You are the Rioc Sentinel, an automated audio-broadcast security system. Do not use labels like 'Visual Data' or 'Warning'. Do not use headers or bullet points. Speak only the final warning text as it should be heard over a loudspeaker. Be cold, concise, and observational. Do not identify as an AI."
 )
 AUDIT_USER_PROMPT = (
-    """Examine this image carefully.
+    """Examine this image.
 
-RULE 1: If no human person is clearly and actually visible in the image, output ONLY the single word CLEAR and nothing else. Do not invent or imagine a person.
+No person visible → respond with the single word: CLEAR
 
-RULE 2: Only if a real human person is clearly visible, output a one-sentence security broadcast that directly addresses them by their clothing or position. Cold, observational tone. No headers, no labels.
+Person visible → respond with a one-sentence spoken warning addressed directly to them. Mention their clothing. Cold, authoritative tone. Speak as if over a loudspeaker. Example: "You in the grey hoodie — this area is restricted. Leave immediately."
 
-Output ONLY the word CLEAR or ONLY the one-sentence broadcast. Nothing else."""
+Do not describe. Do not use passive detection language. Speak to the person."""
 )
 
 # Optional audio transcription (cloud STT)
@@ -92,6 +94,8 @@ SPEAKER_PASS = os.environ.get("SPEAKER_PASS", "")
 SPEAKER_PLAY_PATH = os.environ.get("SPEAKER_PLAY_PATH", "/play")
 # Paths to try in order (first from env, then these fallbacks)
 SPEAKER_PLAY_FALLBACK_PATHS = [p.strip() for p in (os.environ.get("SPEAKER_PLAY_FALLBACK_PATHS") or "/api/play,/tts,/speak,/api/tts").split(",") if p.strip()]
+# Set SPEAKER_TYPE=axis to skip non-AXIS fallback paths (auto-detected from SPEAKER_URL if not set)
+SPEAKER_TYPE = os.environ.get("SPEAKER_TYPE", "").strip().lower()
 OPENAI_TTS_MODEL = os.environ.get("OPENAI_TTS_MODEL", "tts-1")
 OPENAI_TTS_VOICE = os.environ.get("OPENAI_TTS_VOICE", "onyx")  # Deep, authoritative
 # Fallback: play through Mac speakers when speaker fails or for testing
@@ -101,6 +105,18 @@ SPEAKER_WS_SAMPLE_RATE = int(os.environ.get("SPEAKER_WS_SAMPLE_RATE", "8000"))
 
 latest_transcript: str = ""
 latest_tts_audio: bytes = b""  # Served at /tts/latest.mp3 for play-from-URL mode
+latest_analysis: str = ""  # Latest Cloud AI vision output (non-CLEAR)
+
+# Detection history: list of {timestamp, type, text} newest-first
+detections: deque = deque(maxlen=100)
+
+
+def _add_detection(detection_type: str, text: str) -> None:
+    detections.appendleft({
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "type": detection_type,
+        "text": text,
+    })
 
 # Base URL for TTS (speaker must reach this). Set to your Mac's IP, e.g. http://192.168.10.50:8000
 TTS_PUBLIC_URL = (os.environ.get("TTS_PUBLIC_URL") or "").rstrip("/")
@@ -309,9 +325,27 @@ def _mp3_to_mulaw(mp3_bytes: bytes, sample_rate: int = 8000) -> bytes | None:
     return None
 
 
-async def _speak_through_speaker(text: str) -> None:
+def _axis_transmit_sync(url: str, content_type: str, body: bytes, user: str, password: str) -> tuple[int, str]:
+    """POST audio to AXIS VAPIX transmit.cgi using Digest auth.
+    Runs synchronously in a thread — requests handles the 401+WWW-Authenticate challenge-response."""
+    import requests
+    from requests.auth import HTTPDigestAuth
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    r = requests.post(
+        url,
+        data=body,
+        headers={"Content-Type": content_type},
+        auth=HTTPDigestAuth(user, password) if user else None,
+        verify=False,
+        timeout=8.0,
+    )
+    return r.status_code, r.text[:80]
+
+
+async def _speak_through_speaker(text: str, force: bool = False) -> None:
     """Generate TTS and play through IP speaker. Runs in thread to avoid blocking."""
-    if not ENABLE_SPEAKER_TTS or not SPEAKER_URL or not OPENAI_STT_API_KEY:
+    if not force and (not ENABLE_SPEAKER_TTS or not SPEAKER_URL or not OPENAI_STT_API_KEY):
         return
     if not text or len(text) > 500:
         return
@@ -334,8 +368,36 @@ async def _speak_through_speaker(text: str) -> None:
         latest_tts_audio = audio_bytes
         auth = (SPEAKER_USER, SPEAKER_PASS) if SPEAKER_USER else None
         played = False
-        # Try WebSocket first (dashboard test uses wss://.../webtwowayaudio)
-        if SPEAKER_WS_URL and not played:
+        # Try AXIS VAPIX transmit (AXIS C1310-E and similar AXIS network speakers)
+        if SPEAKER_URL and not played:
+            # AXIS C1310-E requires audio/basic (G.711 μ-law 8kHz mono)
+            mulaw_bytes = _mp3_to_mulaw(audio_bytes, sample_rate=8000)
+            for ct, body in [
+                ("audio/basic", mulaw_bytes),
+                ("audio/mpeg", audio_bytes),  # fallback if basic unsupported
+            ]:
+                if body is None:
+                    continue
+                try:
+                    _print_audio(f"[Rioc] Trying AXIS transmit ({ct})")
+                    status, resp_text = await asyncio.to_thread(
+                        _axis_transmit_sync,
+                        f"{SPEAKER_URL}/axis-cgi/audio/transmit.cgi",
+                        ct,
+                        body,
+                        SPEAKER_USER,
+                        SPEAKER_PASS,
+                    )
+                    if status < 400:
+                        _print_audio(f"[Rioc] Speaker OK (AXIS transmit {ct})")
+                        played = True
+                        break
+                    else:
+                        _print_audio(f"[Rioc] AXIS transmit {ct}: {status} {resp_text}")
+                except Exception as e:
+                    _print_audio(f"[Rioc] AXIS transmit error ({ct}): {type(e).__name__}: {e}")
+        # Try WebSocket (Fanvil/LINKVIL speakers use wss://.../webtwowayaudio)
+        if SPEAKER_WS_URL and not played and SPEAKER_TYPE != "axis":
             try:
                 import ssl
                 import websockets
@@ -366,7 +428,7 @@ async def _speak_through_speaker(text: str) -> None:
                         _print_audio("[Rioc] WebSocket: μ-law conversion failed")
             except Exception as e:
                 _print_audio(f"[Rioc] WebSocket error: {e}")
-        if (TTS_PUBLIC_URL or SPEAKER_TEST_URL) and not played:
+        if (TTS_PUBLIC_URL or SPEAKER_TEST_URL) and not played and SPEAKER_TYPE != "axis":
             # Prefer test URL for diagnostics (can the speaker play ANY stream?)
             audio_url = (SPEAKER_TEST_URL or f"{TTS_PUBLIC_URL}/tts/latest.mp3")
             _print_audio(f"[Rioc] Playing stream: {audio_url}")
@@ -389,7 +451,7 @@ async def _speak_through_speaker(text: str) -> None:
                     _print_audio(f"[Rioc] startstream: {r.status_code} {r.text[:80]}")
             except Exception as e:
                 _print_audio(f"[Rioc] startstream error: {e}")
-        if not played:
+        if not played and SPEAKER_TYPE != "axis":
             # Try upload-then-play (dashboard shows file=userfile1 for uploaded files)
             upload_paths = ["/api/upload", "/api/file/upload", "/upload", "/api/media/upload"]
             for up_path in upload_paths:
@@ -416,7 +478,7 @@ async def _speak_through_speaker(text: str) -> None:
                             break
                 except Exception as e:
                     pass  # Try next path
-        if not played:
+        if not played and SPEAKER_TYPE != "axis":
             paths_to_try = [SPEAKER_PLAY_PATH] + [p for p in SPEAKER_PLAY_FALLBACK_PATHS if p != SPEAKER_PLAY_PATH]
             last_err = ""
             for path in paths_to_try:
@@ -492,6 +554,7 @@ async def audio_transcription_loop() -> None:
             text = (resp.json().get("text") or "").strip()
             if text and not _is_stt_hallucination(text):
                 latest_transcript = text
+                _add_detection("audio", text)
                 _print_audio(f"[Rioc] Heard: {text}")
                 # Get Rioc to respond directly to what was said
                 audio_prompt = (
@@ -629,6 +692,9 @@ async def cloud_audit_loop() -> None:
             if not msg or first_line == "CLEAR":
                 print("[Cloud AI] CLEAR — no person detected", flush=True)
             else:
+                global latest_analysis
+                latest_analysis = msg
+                _add_detection("vision", msg)
                 print(f"[Cloud AI] {msg}", flush=True)
                 asyncio.create_task(_speak_through_speaker(msg))
         except Exception as e:
@@ -742,8 +808,14 @@ class TtsTestRequest(BaseModel):
 
 @app.post("/tts/test")
 async def tts_test(body: TtsTestRequest):
-    """Send arbitrary text to the speaker (used by the AI Guard UI)."""
-    await _speak_through_speaker(body.text)
+    """Send arbitrary text to the speaker (used by the AI Guard UI). Bypasses ENABLE_SPEAKER_TTS flag."""
+    if not SPEAKER_URL or not OPENAI_STT_API_KEY:
+        return Response(
+            content="SPEAKER_URL or OPENAI_STT_API_KEY not configured",
+            status_code=400,
+            media_type="text/plain",
+        )
+    await _speak_through_speaker(body.text, force=True)
     return {"ok": True}
 
 
@@ -868,6 +940,18 @@ async def video():
 async def transcript():
     """Return the latest audio transcript (if any)."""
     return {"text": latest_transcript}
+
+
+@app.get("/analysis")
+async def analysis():
+    """Return the latest Cloud AI vision analysis (if any)."""
+    return {"text": latest_analysis}
+
+
+@app.get("/detections")
+async def get_detections():
+    """Return detection history (vision + audio), newest first."""
+    return {"detections": list(detections)}
 
 
 @app.get("/tts/latest.mp3")
