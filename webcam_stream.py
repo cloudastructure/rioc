@@ -46,6 +46,8 @@ OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "openbmb/minicpm-v2.
 AUDIT_INTERVAL_SEC = float(os.environ.get("AUDIT_INTERVAL_SEC", "2.0"))
 # Require this many consecutive non-CLEAR results before firing TTS/log (reduces false positives)
 AUDIT_CONFIRM_FRAMES = int(os.environ.get("AUDIT_CONFIRM_FRAMES", "2"))
+# Size to resize frames to before sending to cloud AI (smaller = faster inference, default 320x320)
+AUDIT_AI_FRAME_SIZE = int(os.environ.get("AUDIT_AI_FRAME_SIZE", "320"))
 
 # Optional cloud AI visual analysis (OpenAI-compatible vLLM server)
 ENABLE_CLOUD_AI = os.environ.get("ENABLE_CLOUD_AI", "").strip().lower() in ("1", "true", "yes")
@@ -654,13 +656,27 @@ async def local_audit_loop() -> None:
             print(f"[Visual Audit] Request failed: {e}")
 
 
+def _get_ai_frame() -> bytes | None:
+    """Grab one frame and resize to AUDIT_AI_FRAME_SIZE for cloud AI (smaller = faster inference)."""
+    with cap_lock:
+        if cap is None or not cap.isOpened():
+            return None
+        ret, frame = cap.read()
+    if not ret or frame is None:
+        return None
+    frame = cv2.resize(frame, (AUDIT_AI_FRAME_SIZE, AUDIT_AI_FRAME_SIZE), interpolation=cv2.INTER_LINEAR)
+    _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    return jpeg.tobytes()
+
+
 async def cloud_audit_loop() -> None:
-    """Background task: every AUDIT_INTERVAL_SEC, grab a frame and send to cloud vLLM for visual analysis."""
+    """Background task: send frames to cloud vLLM as fast as the model responds (pipeline mode).
+    No fixed interval — the loop fires the next request immediately after the previous one completes."""
     consecutive_detections = 0
     while True:
-        await asyncio.sleep(AUDIT_INTERVAL_SEC)
-        jpeg_bytes = await asyncio.to_thread(get_next_frame)
+        jpeg_bytes = await asyncio.to_thread(_get_ai_frame)
         if not jpeg_bytes:
+            await asyncio.sleep(0.5)
             continue
         b64 = base64.standard_b64encode(jpeg_bytes).decode("ascii")
         context = AUDIT_USER_PROMPT
@@ -686,7 +702,7 @@ async def cloud_audit_loop() -> None:
                                 ],
                             }
                         ],
-                        "max_tokens": 300,
+                        "max_tokens": 60,
                     },
                     timeout=60.0,
                 )
