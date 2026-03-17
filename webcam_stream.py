@@ -825,6 +825,7 @@ class ConfigureRequest(BaseModel):
     speakerUser: str | None = None
     speakerPass: str | None = None
     speakerWsUrl: str | None = None
+    speakerType: str | None = None  # e.g. "axis" — overrides SPEAKER_TYPE env var
 
 
 async def _probe_rtsp(url: str) -> bool:
@@ -856,7 +857,7 @@ def _open_capture(url: str) -> cv2.VideoCapture:
 @app.post("/configure")
 async def configure(body: ConfigureRequest):
     """Hot-swap camera source and/or speaker settings without restarting."""
-    global cap, SPEAKER_URL, SPEAKER_USER, SPEAKER_PASS, SPEAKER_WS_URL
+    global cap, SPEAKER_URL, SPEAKER_USER, SPEAKER_PASS, SPEAKER_WS_URL, SPEAKER_TYPE
 
     if body.cameraRtspUrl is not None:
         # Use ffprobe to validate before touching OpenCV (prevents macOS segfault on bad RTSP)
@@ -902,6 +903,9 @@ async def configure(body: ConfigureRequest):
         SPEAKER_PASS = body.speakerPass
     if body.speakerWsUrl is not None:
         SPEAKER_WS_URL = body.speakerWsUrl
+    if body.speakerType is not None:
+        SPEAKER_TYPE = body.speakerType.strip().lower()
+        logger.info("Speaker type updated to: %s", SPEAKER_TYPE)
 
     return {"ok": True}
 
