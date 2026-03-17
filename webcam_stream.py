@@ -43,7 +43,9 @@ logger = logging.getLogger(__name__)
 ENABLE_LOCAL_AUDIT = os.environ.get("ENABLE_LOCAL_AUDIT", "").strip().lower() in ("1", "true", "yes")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "openbmb/minicpm-v2.6")
-AUDIT_INTERVAL_SEC = float(os.environ.get("AUDIT_INTERVAL_SEC", "5.0"))
+AUDIT_INTERVAL_SEC = float(os.environ.get("AUDIT_INTERVAL_SEC", "2.0"))
+# Require this many consecutive non-CLEAR results before firing TTS/log (reduces false positives)
+AUDIT_CONFIRM_FRAMES = int(os.environ.get("AUDIT_CONFIRM_FRAMES", "2"))
 
 # Optional cloud AI visual analysis (OpenAI-compatible vLLM server)
 ENABLE_CLOUD_AI = os.environ.get("ENABLE_CLOUD_AI", "").strip().lower() in ("1", "true", "yes")
@@ -57,9 +59,10 @@ AUDIT_SYSTEM_PROMPT = (
 AUDIT_USER_PROMPT = (
     """Examine this image.
 
-No person visible → respond with the single word: CLEAR
+No clearly visible person → respond with the single word: CLEAR
+If unsure whether a shape is a person → respond CLEAR
 
-Person visible → respond with a one-sentence spoken warning addressed directly to them. Mention their clothing. Cold, authoritative tone. Speak as if over a loudspeaker. Example: "You in the grey hoodie — this area is restricted. Leave immediately."
+Person clearly visible → respond with a one-sentence spoken warning addressed directly to them. Mention their clothing. Cold, authoritative tone. Speak as if over a loudspeaker. Example: "You in the grey hoodie — this area is restricted. Leave immediately."
 
 Do not describe. Do not use passive detection language. Speak to the person."""
 )
@@ -653,6 +656,7 @@ async def local_audit_loop() -> None:
 
 async def cloud_audit_loop() -> None:
     """Background task: every AUDIT_INTERVAL_SEC, grab a frame and send to cloud vLLM for visual analysis."""
+    consecutive_detections = 0
     while True:
         await asyncio.sleep(AUDIT_INTERVAL_SEC)
         jpeg_bytes = await asyncio.to_thread(get_next_frame)
@@ -690,13 +694,17 @@ async def cloud_audit_loop() -> None:
             msg = _strip_think_tags(((resp.json().get("choices") or [{}])[0].get("message") or {}).get("content") or "")
             first_line = msg.split('\n')[0].strip().upper()
             if not msg or first_line == "CLEAR":
+                consecutive_detections = 0
                 print("[Cloud AI] CLEAR — no person detected", flush=True)
             else:
-                global latest_analysis
-                latest_analysis = msg
-                _add_detection("vision", msg)
-                print(f"[Cloud AI] {msg}", flush=True)
-                asyncio.create_task(_speak_through_speaker(msg))
+                consecutive_detections += 1
+                print(f"[Cloud AI] (frame {consecutive_detections}/{AUDIT_CONFIRM_FRAMES}) {msg}", flush=True)
+                if consecutive_detections >= AUDIT_CONFIRM_FRAMES:
+                    consecutive_detections = 0
+                    global latest_analysis
+                    latest_analysis = msg
+                    _add_detection("vision", msg)
+                    asyncio.create_task(_speak_through_speaker(msg))
         except Exception as e:
             print(f"[Cloud AI] Request failed: {e}", flush=True)
 
