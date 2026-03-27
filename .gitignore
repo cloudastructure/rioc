@@ -28,3 +28,6 @@ Thumbs.db
 # Project specific
 *.log
 .env
+
+# YOLO model weights (auto-downloaded at runtime)
+*.pt

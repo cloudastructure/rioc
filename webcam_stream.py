@@ -49,6 +49,12 @@ AUDIT_CONFIRM_FRAMES = int(os.environ.get("AUDIT_CONFIRM_FRAMES", "2"))
 # Size to resize frames to before sending to cloud AI (smaller = faster inference, default 320x320)
 AUDIT_AI_FRAME_SIZE = int(os.environ.get("AUDIT_AI_FRAME_SIZE", "320"))
 
+# YOLO person detection pre-filter: gates VLM calls — only sends to LLM when YOLO sees a person.
+# Dramatically reduces cloud costs and latency. Set ENABLE_YOLO=0 to disable.
+ENABLE_YOLO = os.environ.get("ENABLE_YOLO", "1").strip().lower() in ("1", "true", "yes")
+YOLO_MODEL = os.environ.get("YOLO_MODEL", "yolov8n.pt")  # nano model: fast, ~6MB
+YOLO_CONFIDENCE = float(os.environ.get("YOLO_CONFIDENCE", "0.45"))
+
 # Optional cloud AI visual analysis (OpenAI-compatible vLLM server)
 ENABLE_CLOUD_AI = os.environ.get("ENABLE_CLOUD_AI", "").strip().lower() in ("1", "true", "yes")
 CLOUD_AI_URL = (os.environ.get("CLOUD_AI_URL") or "").rstrip("/")
@@ -220,6 +226,28 @@ def _is_audio_silent(wav_bytes: bytes) -> bool:
 # Global camera; set in lifespan, released on shutdown.
 cap: cv2.VideoCapture | None = None
 cap_lock = threading.Lock()  # Guards all reads/writes of cap
+
+# YOLO singleton — loaded once on first use.
+_yolo_model = None
+_yolo_model_lock = threading.Lock()
+
+
+def _get_yolo_model():
+    """Lazy-load the YOLO model (thread-safe singleton)."""
+    global _yolo_model
+    if _yolo_model is None:
+        with _yolo_model_lock:
+            if _yolo_model is None:
+                from ultralytics import YOLO  # noqa: PLC0415
+                print(f"[YOLO] Loading model: {YOLO_MODEL}", flush=True)
+                _yolo_model = YOLO(YOLO_MODEL)
+    return _yolo_model
+
+
+def _yolo_person_in_frame(frame: np.ndarray) -> bool:
+    """Return True if YOLO detects at least one person (COCO class 0) in frame."""
+    results = _get_yolo_model()(frame, classes=[0], conf=YOLO_CONFIDENCE, verbose=False)
+    return any(len(r.boxes) > 0 for r in results)
 
 FRAME_SIZE = (640, 640)
 JPEG_QUALITY = 70
@@ -483,6 +511,35 @@ async def _speak_through_speaker(text: str, force: bool = False) -> None:
                             break
                 except Exception as e:
                     pass  # Try next path
+        # Generic IP speaker (Fanvil/LINKVIL and similar): upload to /cgi-bin/mediaupload, play via /api/spkplay
+        if not played and SPEAKER_TYPE == "ipspk":
+            try:
+                _print_audio("[Rioc] Trying IP speaker upload (/cgi-bin/mediaupload + /api/spkplay)")
+                async with httpx.AsyncClient(verify=False) as client:
+                    r = await client.post(
+                        f"{SPEAKER_URL}/cgi-bin/mediaupload?idx=1",
+                        files={"upload1": ("tts.mp3", audio_bytes, "audio/mpeg")},
+                        auth=auth,
+                        timeout=30.0,
+                    )
+                if r.status_code < 400:
+                    async with httpx.AsyncClient(verify=False) as client:
+                        r2 = await client.get(
+                            f"{SPEAKER_URL}/api/spkplay",
+                            params={"action": "start", "fileid": 1},
+                            auth=auth,
+                            timeout=10.0,
+                        )
+                    if r2.status_code < 400:
+                        _print_audio("[Rioc] Speaker OK (ipspk upload+spkplay)")
+                        played = True
+                    else:
+                        _print_audio(f"[Rioc] ipspk spkplay: {r2.status_code} {r2.text[:80]}")
+                else:
+                    _print_audio(f"[Rioc] ipspk upload failed: {r.status_code} {r.text[:80]}")
+            except Exception as e:
+                _print_audio(f"[Rioc] ipspk error: {e}")
+
         if not played and SPEAKER_TYPE != "axis":
             paths_to_try = [SPEAKER_PLAY_PATH] + [p for p in SPEAKER_PLAY_FALLBACK_PATHS if p != SPEAKER_PLAY_PATH]
             last_err = ""
@@ -619,9 +676,16 @@ async def local_audit_loop() -> None:
     """Background task: every AUDIT_INTERVAL_SEC, grab a frame and send to Ollama for Visual Audit."""
     while True:
         await asyncio.sleep(AUDIT_INTERVAL_SEC)
-        jpeg_bytes = await asyncio.to_thread(get_next_frame)
-        if not jpeg_bytes:
+        frame = await asyncio.to_thread(_get_raw_ai_frame)
+        if frame is None:
             continue
+        if ENABLE_YOLO:
+            person_detected = await asyncio.to_thread(_yolo_person_in_frame, frame)
+            if not person_detected:
+                print("[Local Audit] YOLO: no person — skipping VLM", flush=True)
+                continue
+        _, jpeg_enc = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        jpeg_bytes = jpeg_enc.tobytes()
         b64 = base64.standard_b64encode(jpeg_bytes).decode("ascii")
         # Incorporate latest transcript into the prompt if available.
         context = AUDIT_USER_PROMPT
@@ -656,28 +720,44 @@ async def local_audit_loop() -> None:
             print(f"[Visual Audit] Request failed: {e}")
 
 
-def _get_ai_frame() -> bytes | None:
-    """Grab one frame and resize to AUDIT_AI_FRAME_SIZE for cloud AI (smaller = faster inference)."""
+def _get_raw_ai_frame() -> np.ndarray | None:
+    """Grab one frame and resize to AUDIT_AI_FRAME_SIZE. Returns numpy array (for YOLO or encoding)."""
     with cap_lock:
         if cap is None or not cap.isOpened():
             return None
         ret, frame = cap.read()
     if not ret or frame is None:
         return None
-    frame = cv2.resize(frame, (AUDIT_AI_FRAME_SIZE, AUDIT_AI_FRAME_SIZE), interpolation=cv2.INTER_LINEAR)
+    return cv2.resize(frame, (AUDIT_AI_FRAME_SIZE, AUDIT_AI_FRAME_SIZE), interpolation=cv2.INTER_LINEAR)
+
+
+def _get_ai_frame() -> bytes | None:
+    """Grab one frame and resize to AUDIT_AI_FRAME_SIZE for cloud AI (smaller = faster inference)."""
+    frame = _get_raw_ai_frame()
+    if frame is None:
+        return None
     _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
     return jpeg.tobytes()
 
 
 async def cloud_audit_loop() -> None:
     """Background task: send frames to cloud vLLM as fast as the model responds (pipeline mode).
+    YOLO pre-filters each frame — the VLM is only called when YOLO detects a person.
     No fixed interval — the loop fires the next request immediately after the previous one completes."""
     consecutive_detections = 0
     while True:
-        jpeg_bytes = await asyncio.to_thread(_get_ai_frame)
-        if not jpeg_bytes:
+        frame = await asyncio.to_thread(_get_raw_ai_frame)
+        if frame is None:
             await asyncio.sleep(0.5)
             continue
+        if ENABLE_YOLO:
+            person_detected = await asyncio.to_thread(_yolo_person_in_frame, frame)
+            if not person_detected:
+                consecutive_detections = 0
+                print("[Cloud AI] YOLO: no person — skipping VLM", flush=True)
+                continue
+        _, jpeg_enc = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        jpeg_bytes = jpeg_enc.tobytes()
         b64 = base64.standard_b64encode(jpeg_bytes).decode("ascii")
         context = AUDIT_USER_PROMPT
         if latest_transcript:
@@ -850,6 +930,7 @@ class ConfigureRequest(BaseModel):
     speakerPass: str | None = None
     speakerWsUrl: str | None = None
     speakerType: str | None = None  # e.g. "axis" — overrides SPEAKER_TYPE env var
+    enableYolo: bool | None = None  # Toggle YOLO person-detection pre-filter at runtime
 
 
 async def _probe_rtsp(url: str) -> bool:
@@ -881,7 +962,7 @@ def _open_capture(url: str) -> cv2.VideoCapture:
 @app.post("/configure")
 async def configure(body: ConfigureRequest):
     """Hot-swap camera source and/or speaker settings without restarting."""
-    global cap, SPEAKER_URL, SPEAKER_USER, SPEAKER_PASS, SPEAKER_WS_URL, SPEAKER_TYPE
+    global cap, SPEAKER_URL, SPEAKER_USER, SPEAKER_PASS, SPEAKER_WS_URL, SPEAKER_TYPE, ENABLE_YOLO
 
     if body.cameraRtspUrl is not None:
         # Use ffprobe to validate before touching OpenCV (prevents macOS segfault on bad RTSP)
@@ -930,6 +1011,9 @@ async def configure(body: ConfigureRequest):
     if body.speakerType is not None:
         SPEAKER_TYPE = body.speakerType.strip().lower()
         logger.info("Speaker type updated to: %s", SPEAKER_TYPE)
+    if body.enableYolo is not None:
+        ENABLE_YOLO = body.enableYolo
+        logger.info("YOLO person detection %s", "enabled" if ENABLE_YOLO else "disabled")
 
     return {"ok": True}
 
