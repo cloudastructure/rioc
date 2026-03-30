@@ -24,8 +24,10 @@ from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
 import datetime
+import json
 import re
 import threading
+import time
 from collections import deque
 import numpy as np
 import cv2
@@ -54,6 +56,9 @@ AUDIT_AI_FRAME_SIZE = int(os.environ.get("AUDIT_AI_FRAME_SIZE", "320"))
 ENABLE_YOLO = os.environ.get("ENABLE_YOLO", "1").strip().lower() in ("1", "true", "yes")
 YOLO_MODEL = os.environ.get("YOLO_MODEL", "yolov8n.pt")  # nano model: fast, ~6MB
 YOLO_CONFIDENCE = float(os.environ.get("YOLO_CONFIDENCE", "0.45"))
+# Frame source: "local_yolo" (webcam + local YOLO) or "live_ffmpeg" (subscribe to CVR detections).
+# local_yolo is the default for dev/demo. live_ffmpeg is the production path once the AGX interface is confirmed.
+FRAME_SOURCE = os.environ.get("FRAME_SOURCE", "local_yolo").strip().lower()
 
 # Optional cloud AI visual analysis (OpenAI-compatible vLLM server)
 ENABLE_CLOUD_AI = os.environ.get("ENABLE_CLOUD_AI", "").strip().lower() in ("1", "true", "yes")
@@ -107,6 +112,8 @@ SPEAKER_PLAY_PATH = os.environ.get("SPEAKER_PLAY_PATH", "/play")
 SPEAKER_PLAY_FALLBACK_PATHS = [p.strip() for p in (os.environ.get("SPEAKER_PLAY_FALLBACK_PATHS") or "/api/play,/tts,/speak,/api/tts").split(",") if p.strip()]
 # Set SPEAKER_TYPE=axis to skip non-AXIS fallback paths (auto-detected from SPEAKER_URL if not set)
 SPEAKER_TYPE = os.environ.get("SPEAKER_TYPE", "").strip().lower()
+# Minimum seconds between TTS announcements — prevents rapid-fire warnings interrupting each other
+TTS_COOLDOWN_SEC = float(os.environ.get("TTS_COOLDOWN_SEC", "20.0"))
 OPENAI_TTS_MODEL = os.environ.get("OPENAI_TTS_MODEL", "tts-1")
 OPENAI_TTS_VOICE = os.environ.get("OPENAI_TTS_VOICE", "onyx")  # Deep, authoritative
 # Fallback: play through Mac speakers when speaker fails or for testing
@@ -118,16 +125,35 @@ latest_transcript: str = ""
 latest_tts_audio: bytes = b""  # Served at /tts/latest.mp3 for play-from-URL mode
 latest_analysis: str = ""  # Latest Cloud AI vision output (non-CLEAR)
 
+# TTS rate-limiting: one announcement at a time with a cooldown between them.
+# _tts_active is set True before the first await, so asyncio's single-threaded model
+# makes this check+set atomic — no two coroutines can both see it False simultaneously.
+_tts_active: bool = False
+_last_tts_time: float = 0.0
+
 # Detection history: list of {timestamp, type, text} newest-first
 detections: deque = deque(maxlen=100)
 
+# SSE subscribers: one asyncio.Queue per connected /detections/stream client
+_sse_subscribers: list[asyncio.Queue] = []
+
+# Frames that passed person detection, waiting for vLLM — size 1 ensures freshest frame is always used
+_detection_frame_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+
 
 def _add_detection(detection_type: str, text: str) -> None:
-    detections.appendleft({
+    d = {
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
         "type": detection_type,
         "text": text,
-    })
+    }
+    detections.appendleft(d)
+    # Instantly push to all connected SSE clients (called from async context — put_nowait is safe)
+    for q in list(_sse_subscribers):
+        try:
+            q.put_nowait(d)
+        except asyncio.QueueFull:
+            pass  # Slow client — drop rather than block
 
 # Base URL for TTS (speaker must reach this). Set to your Mac's IP, e.g. http://192.168.10.50:8000
 TTS_PUBLIC_URL = (os.environ.get("TTS_PUBLIC_URL") or "").rstrip("/")
@@ -247,7 +273,13 @@ def _get_yolo_model():
 def _yolo_person_in_frame(frame: np.ndarray) -> bool:
     """Return True if YOLO detects at least one person (COCO class 0) in frame."""
     results = _get_yolo_model()(frame, classes=[0], conf=YOLO_CONFIDENCE, verbose=False)
-    return any(len(r.boxes) > 0 for r in results)
+    detected = any(len(r.boxes) > 0 for r in results)
+    if not detected:
+        # Log best confidence seen so we can tune the threshold
+        best = max((float(box.conf) for r in results for box in r.boxes), default=0.0)
+        if best > 0.05:
+            print(f"[YOLO] Best conf={best:.2f} (threshold={YOLO_CONFIDENCE}) — not detected", flush=True)
+    return detected
 
 FRAME_SIZE = (640, 640)
 JPEG_QUALITY = 70
@@ -336,8 +368,26 @@ def _print_audio(msg: str) -> None:
     print(msg, flush=True)
 
 
+def _wav_to_mp3(wav_bytes: bytes) -> bytes | None:
+    """Convert WAV to MP3 via ffmpeg. Used when MiniCPM-o returns WAV and speaker needs MP3."""
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-i", "pipe:0", "-f", "mp3", "-q:a", "2", "pipe:1"],
+            input=wav_bytes,
+            capture_output=True,
+            timeout=30,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            return proc.stdout
+    except FileNotFoundError:
+        logger.warning("ffmpeg not found. Install with: brew install ffmpeg")
+    except Exception as e:
+        logger.warning("WAV to MP3 conversion failed: %s", e)
+    return None
+
+
 def _mp3_to_mulaw(mp3_bytes: bytes, sample_rate: int = 8000) -> bytes | None:
-    """Convert MP3 to G.711 μ-law at 8kHz - format talk.js sends to speaker."""
+    """Convert MP3 (or WAV) to G.711 μ-law at 8kHz - format talk.js sends to speaker."""
     try:
         proc = subprocess.run(
             [
@@ -376,33 +426,43 @@ def _axis_transmit_sync(url: str, content_type: str, body: bytes, user: str, pas
     return r.status_code, r.text[:80]
 
 
-async def _speak_through_speaker(text: str, force: bool = False) -> None:
-    """Generate TTS and play through IP speaker. Runs in thread to avoid blocking."""
-    if not force and (not ENABLE_SPEAKER_TTS or not SPEAKER_URL or not OPENAI_STT_API_KEY):
+async def _guarded_play(audio_bytes: bytes, audio_format: str = "wav", force: bool = False) -> None:
+    """Deliver pre-generated audio to the IP speaker with TTS guard (rate-limit + no overlaps).
+    audio_format: "wav" (from MiniCPM-o) or "mp3". WAV is converted to MP3 before delivery."""
+    global _tts_active, _last_tts_time, latest_tts_audio
+    if not force and (not ENABLE_SPEAKER_TTS or not SPEAKER_URL):
         return
-    if not text or len(text) > 500:
+    if not audio_bytes:
         return
-    try:
-        _print_audio("[Rioc] Generating speech...")
-        def _tts():
-            client = OpenAI(api_key=OPENAI_STT_API_KEY)
-            resp = client.audio.speech.create(
-                model=OPENAI_TTS_MODEL,
-                voice=OPENAI_TTS_VOICE,
-                input=text[:500],
-            )
-            return resp.content
-
-        audio_bytes = await asyncio.to_thread(_tts)
-        if not audio_bytes:
-            _print_audio("[Rioc] TTS returned no audio")
+    if not force:
+        if _tts_active:
+            _print_audio("[Rioc] TTS in progress — dropping")
             return
-        global latest_tts_audio
-        latest_tts_audio = audio_bytes
+        now = time.monotonic()
+        if now - _last_tts_time < TTS_COOLDOWN_SEC:
+            remaining = TTS_COOLDOWN_SEC - (now - _last_tts_time)
+            _print_audio(f"[Rioc] TTS cooldown — {remaining:.0f}s remaining")
+            return
+    if _tts_active:
+        return  # Prevent overlap even for forced calls
+    _tts_active = True  # Set before first await — atomic in asyncio (no context switch possible)
+    _last_tts_time = time.monotonic()
+    try:
+        # Normalize to MP3 — all speaker delivery paths below expect MP3 bytes
+        if audio_format == "wav":
+            _print_audio("[Rioc] Converting WAV → MP3...")
+            mp3_bytes = await asyncio.to_thread(_wav_to_mp3, audio_bytes)
+            if not mp3_bytes:
+                _print_audio("[Rioc] WAV→MP3 conversion failed")
+                return
+        else:
+            mp3_bytes = audio_bytes
+        latest_tts_audio = mp3_bytes
+        audio_bytes = mp3_bytes  # alias for the delivery code below
         auth = (SPEAKER_USER, SPEAKER_PASS) if SPEAKER_USER else None
         played = False
         # Try AXIS VAPIX transmit (AXIS C1310-E and similar AXIS network speakers)
-        if SPEAKER_URL and not played:
+        if SPEAKER_URL and not played and SPEAKER_TYPE == "axis":
             # AXIS C1310-E requires audio/basic (G.711 μ-law 8kHz mono)
             mulaw_bytes = _mp3_to_mulaw(audio_bytes, sample_rate=8000)
             for ct, body in [
@@ -430,7 +490,7 @@ async def _speak_through_speaker(text: str, force: bool = False) -> None:
                 except Exception as e:
                     _print_audio(f"[Rioc] AXIS transmit error ({ct}): {type(e).__name__}: {e}")
         # Try WebSocket (Fanvil/LINKVIL speakers use wss://.../webtwowayaudio)
-        if SPEAKER_WS_URL and not played and SPEAKER_TYPE != "axis":
+        if SPEAKER_WS_URL and not played and SPEAKER_TYPE not in ("axis", "ipspk"):
             try:
                 import ssl
                 import websockets
@@ -461,7 +521,7 @@ async def _speak_through_speaker(text: str, force: bool = False) -> None:
                         _print_audio("[Rioc] WebSocket: μ-law conversion failed")
             except Exception as e:
                 _print_audio(f"[Rioc] WebSocket error: {e}")
-        if (TTS_PUBLIC_URL or SPEAKER_TEST_URL) and not played and SPEAKER_TYPE != "axis":
+        if (TTS_PUBLIC_URL or SPEAKER_TEST_URL) and not played and SPEAKER_TYPE not in ("axis", "ipspk"):
             # Prefer test URL for diagnostics (can the speaker play ANY stream?)
             audio_url = (SPEAKER_TEST_URL or f"{TTS_PUBLIC_URL}/tts/latest.mp3")
             _print_audio(f"[Rioc] Playing stream: {audio_url}")
@@ -484,7 +544,7 @@ async def _speak_through_speaker(text: str, force: bool = False) -> None:
                     _print_audio(f"[Rioc] startstream: {r.status_code} {r.text[:80]}")
             except Exception as e:
                 _print_audio(f"[Rioc] startstream error: {e}")
-        if not played and SPEAKER_TYPE != "axis":
+        if not played and SPEAKER_TYPE not in ("axis", "ipspk"):
             # Try upload-then-play (dashboard shows file=userfile1 for uploaded files)
             upload_paths = ["/api/upload", "/api/file/upload", "/upload", "/api/media/upload"]
             for up_path in upload_paths:
@@ -567,7 +627,36 @@ async def _speak_through_speaker(text: str, force: bool = False) -> None:
         if not played and ENABLE_LOCAL_PLAYBACK:
             _play_audio_locally(audio_bytes)
     except Exception as e:
-        _print_audio(f"[Rioc] TTS/speaker error: {e}")
+        _print_audio(f"[Rioc] Speaker error: {e}")
+    finally:
+        _tts_active = False
+
+
+async def _speak_through_speaker(text: str, force: bool = False) -> None:
+    """Generate speech for arbitrary text and play on speaker.
+    Used by /tts/test, local_audit_loop, VideoDB, and as fallback when model returns no audio.
+
+    Current backend: OpenAI TTS (model audio output not yet enabled on the vLLM server).
+    TODO: switch to _speak_via_model_audio() below once vLLM is started with --enable-audio-output."""
+    if not text or len(text) > 500:
+        return
+    if not OPENAI_STT_API_KEY:
+        _print_audio("[Rioc] TTS skipped: OPENAI_STT_API_KEY not set")
+        return
+    try:
+        def _tts():
+            client = OpenAI(api_key=OPENAI_STT_API_KEY)
+            resp = client.audio.speech.create(
+                model=OPENAI_TTS_MODEL,
+                voice=OPENAI_TTS_VOICE,
+                input=text[:500],
+            )
+            return resp.content
+        mp3_bytes = await asyncio.to_thread(_tts)
+        if mp3_bytes:
+            await _guarded_play(mp3_bytes, "mp3", force)
+    except Exception as e:
+        _print_audio(f"[Rioc] TTS generation failed: {e}")
 
 
 def _play_audio_locally(audio_bytes: bytes) -> None:
@@ -583,10 +672,11 @@ def _play_audio_locally(audio_bytes: bytes) -> None:
 
 
 async def audio_transcription_loop() -> None:
-    """Background task: capture audio, send to OpenAI STT, update latest_transcript."""
+    """Background task: record mic audio, send to MiniCPM-o for STT + spoken response.
+    MiniCPM-o handles both transcription and response generation in a single call."""
     global latest_transcript
-    if not OPENAI_STT_API_KEY:
-        _print_audio("[Rioc] Audio STT disabled: no OPENAI_STT_API_KEY or OPENAI_API_KEY in .env")
+    if not ENABLE_CLOUD_AI or not CLOUD_AI_URL:
+        _print_audio("[Rioc] Audio loop disabled: ENABLE_CLOUD_AI or CLOUD_AI_URL not set")
         return
     dev_info = ""
     if AUDIO_INPUT_DEVICE:
@@ -594,80 +684,62 @@ async def audio_transcription_loop() -> None:
         if idx is not None:
             dev = sd.query_devices(idx)
             dev_info = f" (input: {dev.get('name', '?')})"
-    _print_audio(f"[Rioc] Audio loop started{dev_info}. Recording {STT_DURATION_SEC}s chunks, then sending to STT...")
-    url = "https://api.openai.com/v1/audio/transcriptions"
-    headers = {"Authorization": f"Bearer {OPENAI_STT_API_KEY}"}
+    _print_audio(f"[Rioc] Audio loop started{dev_info}. Recording {STT_DURATION_SEC}s chunks...")
     while True:
-        _print_audio("[Rioc] Recording chunk (5 sec)...")
+        _print_audio("[Rioc] Recording chunk...")
         wav_bytes = await asyncio.to_thread(_record_audio_chunk)
         if not wav_bytes:
-            _print_audio("[Rioc] Audio capture failed — check mic permissions (System Settings → Privacy → Microphone)")
+            _print_audio("[Rioc] Audio capture failed — check mic permissions")
             await asyncio.sleep(1.0)
             continue
         if _is_audio_silent(wav_bytes):
-            continue  # Skip STT when silent — avoids hallucinations
-        _print_audio("[Rioc] Sending to STT...")
-        files = {"file": ("audio.wav", wav_bytes, "audio/wav")}
-        data = {"model": OPENAI_STT_MODEL, "prompt": STT_PROMPT}
+            continue  # Skip when silent
+        _print_audio("[Rioc] Sending audio to MiniCPM-o...")
+        wav_b64 = base64.standard_b64encode(wav_bytes).decode("ascii")
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.post(url, headers=headers, files=files, data=data, timeout=90.0)
-            resp.raise_for_status()
-            text = (resp.json().get("text") or "").strip()
-            if text and not _is_stt_hallucination(text):
-                latest_transcript = text
-                _add_detection("audio", text)
-                _print_audio(f"[Rioc] Heard: {text}")
-                # Get Rioc to respond directly to what was said
-                audio_prompt = (
-                    f"You are Rioc, a tactical guard. The person in front of you just said: \"{text}\". "
-                    "Respond directly to them in one sentence. Cold, authoritative tone. Do not repeat what they said."
+                resp = await client.post(
+                    f"{CLOUD_AI_URL}/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {CLOUD_AI_API_KEY}"},
+                    json={
+                        "model": CLOUD_AI_MODEL,
+                        "modalities": ["text", "audio"],
+                        "audio": {"voice": "default", "format": "wav"},
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are Rioc, a cold and authoritative security guard. "
+                                    "The person in front of you is speaking. Respond to them directly "
+                                    "in one sentence. Do not transcribe what they said."
+                                ),
+                            },
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_audio", "input_audio": {"data": wav_b64, "format": "wav"}},
+                                ],
+                            },
+                        ],
+                        "max_tokens": 200,
+                    },
+                    timeout=60.0,
                 )
-                if ENABLE_CLOUD_AI and CLOUD_AI_URL:
-                    try:
-                        async with httpx.AsyncClient() as client:
-                            r = await client.post(
-                                f"{CLOUD_AI_URL}/v1/chat/completions",
-                                headers={"Authorization": f"Bearer {CLOUD_AI_API_KEY}"},
-                                json={
-                                    "model": CLOUD_AI_MODEL,
-                                    "messages": [{"role": "user", "content": audio_prompt}],
-                                    "max_tokens": 100,
-                                },
-                                timeout=30.0,
-                            )
-                        r.raise_for_status()
-                        reply = _strip_think_tags(((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or "")
-                        if reply:
-                            _print_audio(f"[Rioc] {reply}")
-                            asyncio.create_task(_speak_through_speaker(reply))
-                    except Exception as e:
-                        logger.debug("Audio response (cloud) failed: %s", e)
-                elif ENABLE_LOCAL_AUDIT:
-                    try:
-                        async with httpx.AsyncClient() as client:
-                            r = await client.post(
-                                f"{OLLAMA_URL.rstrip('/')}/api/chat",
-                                json={
-                                    "model": OLLAMA_VISION_MODEL,
-                                    "messages": [{"role": "user", "content": audio_prompt}],
-                                    "stream": False,
-                                },
-                                timeout=30.0,
-                            )
-                        r.raise_for_status()
-                        reply = (r.json().get("message") or {}).get("content") or ""
-                        if reply.strip():
-                            _print_audio(f"[Rioc] {reply.strip()}")
-                            asyncio.create_task(_speak_through_speaker(reply.strip()))
-                    except Exception as e:
-                        logger.debug("Audio response (local) failed: %s", e)
-            elif text and _is_stt_hallucination(text):
-                pass  # Silently ignore Whisper hallucinations
-            else:
-                _print_audio("[Rioc] STT returned empty (silence or very quiet audio)")
+            resp.raise_for_status()
+            choice_msg = ((resp.json().get("choices") or [{}])[0].get("message") or {})
+            audio_data = choice_msg.get("audio") or {}
+            # Transcript: what the model heard / its text reply
+            transcript = choice_msg.get("content") or audio_data.get("transcript") or ""
+            if transcript:
+                latest_transcript = transcript
+                _add_detection("audio", transcript)
+                _print_audio(f"[Rioc] {transcript}")
+            # Play the model's spoken response
+            response_wav_b64 = audio_data.get("data") or ""
+            if response_wav_b64:
+                asyncio.create_task(_guarded_play(base64.b64decode(response_wav_b64), "wav"))
         except Exception as exc:
-            _print_audio(f"[Rioc] STT failed: {exc}")
+            _print_audio(f"[Rioc] Audio processing failed: {exc}")
         if STT_GAP_SEC > 0:
             await asyncio.sleep(STT_GAP_SEC)
 
@@ -740,29 +812,68 @@ def _get_ai_frame() -> bytes | None:
     return jpeg.tobytes()
 
 
-async def cloud_audit_loop() -> None:
-    """Background task: send frames to cloud vLLM as fast as the model responds (pipeline mode).
-    YOLO pre-filters each frame — the VLM is only called when YOLO detects a person.
-    No fixed interval — the loop fires the next request immediately after the previous one completes."""
+YOLO_SCAN_INTERVAL_SEC = float(os.environ.get("YOLO_SCAN_INTERVAL_SEC", "1.0"))
+
+
+async def local_yolo_source_loop() -> None:
+    """Continuously grab webcam frames, run YOLO, and enqueue person-detected frames for vLLM.
+    Runs independently of the vLLM caller so YOLO never stalls waiting on network I/O.
+    Rate-limited to YOLO_SCAN_INTERVAL_SEC (default 1s) to avoid hammering vLLM."""
+    await asyncio.sleep(3.0)  # Camera warmup — discard initial noisy frames
     consecutive_detections = 0
+    absent_frames = 0
     while True:
         frame = await asyncio.to_thread(_get_raw_ai_frame)
         if frame is None:
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.1)
             continue
         if ENABLE_YOLO:
             person_detected = await asyncio.to_thread(_yolo_person_in_frame, frame)
             if not person_detected:
+                print("[YOLO] No person — skipping VLM", flush=True)
                 consecutive_detections = 0
-                print("[Cloud AI] YOLO: no person — skipping VLM", flush=True)
+                absent_frames += 1
+                await asyncio.sleep(YOLO_SCAN_INTERVAL_SEC)
                 continue
+        # Require 2 consecutive detections before treating as a real person entry
+        consecutive_detections += 1
+        absent_frames = 0
+        if consecutive_detections < 2:
+            await asyncio.sleep(0.1)
+            continue
         _, jpeg_enc = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-        jpeg_bytes = jpeg_enc.tobytes()
+        try:
+            # Snapshot transcript at detection time so the vLLM caller has the right context
+            _detection_frame_queue.put_nowait((jpeg_enc.tobytes(), latest_transcript))
+        except asyncio.QueueFull:
+            pass  # vLLM still processing — drop, keep scanning
+        # Rate-limit: wait before next YOLO scan so we don't hammer vLLM with back-to-back frames
+        await asyncio.sleep(YOLO_SCAN_INTERVAL_SEC)
+
+
+async def live_ffmpeg_source_loop() -> None:
+    """Subscribe to live-ffmpeg person detection events from a CVR/AGX device.
+    When a person-detected frame arrives, enqueue it for vLLM processing.
+    TODO: implement once the live-ffmpeg external event interface is confirmed (WebSocket/HTTP/socket).
+    Falls back to local_yolo_source_loop until the interface is wired up."""
+    logger.warning(
+        "FRAME_SOURCE=live_ffmpeg is not yet implemented — falling back to local_yolo_source_loop. "
+        "Wire up the AGX live-ffmpeg interface here once confirmed."
+    )
+    await local_yolo_source_loop()
+
+
+async def cloud_audit_loop() -> None:
+    """Drain frames from the detection queue and send to cloud vLLM.
+    Fires immediately when the frame source enqueues a person-detected frame — no polling interval."""
+    consecutive_detections = 0
+    while True:
+        jpeg_bytes, transcript = await _detection_frame_queue.get()
         b64 = base64.standard_b64encode(jpeg_bytes).decode("ascii")
         context = AUDIT_USER_PROMPT
-        if latest_transcript:
+        if transcript:
             context += (
-                f'\n\nThe person is saying: "{latest_transcript}". '
+                f'\n\nThe person is saying: "{transcript}". '
                 "Factor this audio into your tactical warning."
             )
         full_prompt = AUDIT_SYSTEM_PROMPT + "\n\n" + context
@@ -773,6 +884,8 @@ async def cloud_audit_loop() -> None:
                     headers={"Authorization": f"Bearer {CLOUD_AI_API_KEY}"},
                     json={
                         "model": CLOUD_AI_MODEL,
+                        "modalities": ["text", "audio"],
+                        "audio": {"voice": "default", "format": "wav"},
                         "messages": [
                             {
                                 "role": "user",
@@ -782,12 +895,16 @@ async def cloud_audit_loop() -> None:
                                 ],
                             }
                         ],
-                        "max_tokens": 60,
+                        "max_tokens": 200,
                     },
                     timeout=60.0,
                 )
             resp.raise_for_status()
-            msg = _strip_think_tags(((resp.json().get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+            choice_msg = ((resp.json().get("choices") or [{}])[0].get("message") or {})
+            audio_data = choice_msg.get("audio") or {}
+            # Text for CLEAR check: prefer content, fall back to audio transcript
+            raw_text = choice_msg.get("content") or audio_data.get("transcript") or ""
+            msg = _strip_think_tags(raw_text)
             first_line = msg.split('\n')[0].strip().upper()
             if not msg or first_line == "CLEAR":
                 consecutive_detections = 0
@@ -800,9 +917,59 @@ async def cloud_audit_loop() -> None:
                     global latest_analysis
                     latest_analysis = msg
                     _add_detection("vision", msg)
-                    asyncio.create_task(_speak_through_speaker(msg))
+                    # Use audio bytes from model directly — skip separate TTS generation
+                    wav_b64 = audio_data.get("data") or ""
+                    if wav_b64:
+                        asyncio.create_task(_guarded_play(base64.b64decode(wav_b64), "wav"))
+                    else:
+                        # No audio in response — fall back to text TTS
+                        asyncio.create_task(_speak_through_speaker(msg))
         except Exception as e:
             print(f"[Cloud AI] Request failed: {e}", flush=True)
+
+
+async def _warmup_cloud_ai() -> None:
+    """On startup: check vLLM is running, log model/max-model-len, and send a warmup inference
+    so the model is hot before the first real detection (cold start has significant first-token latency)."""
+    if not ENABLE_CLOUD_AI or not CLOUD_AI_URL:
+        return
+    print("[Cloud AI] Checking vLLM server...", flush=True)
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{CLOUD_AI_URL}/v1/models",
+                headers={"Authorization": f"Bearer {CLOUD_AI_API_KEY}"},
+                timeout=15.0,
+            )
+        if r.status_code == 200:
+            for m in (r.json().get("data") or []):
+                max_len = m.get("max_model_len") or "?"
+                print(f"[Cloud AI] Model: {m.get('id')}  max_model_len={max_len}", flush=True)
+        else:
+            print(f"[Cloud AI] /v1/models returned {r.status_code} — server may not be ready", flush=True)
+    except Exception as e:
+        print(f"[Cloud AI] Could not reach vLLM server: {e}", flush=True)
+        return
+    # Warmup inference — forces model weights into GPU memory before first detection
+    print("[Cloud AI] Sending warmup request...", flush=True)
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{CLOUD_AI_URL}/v1/chat/completions",
+                headers={"Authorization": f"Bearer {CLOUD_AI_API_KEY}"},
+                json={
+                    "model": CLOUD_AI_MODEL,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 1,
+                },
+                timeout=60.0,
+            )
+        if r.status_code < 400:
+            print("[Cloud AI] Warmup complete — model is hot.", flush=True)
+        else:
+            print(f"[Cloud AI] Warmup failed: {r.status_code} {r.text[:80]}", flush=True)
+    except Exception as e:
+        print(f"[Cloud AI] Warmup request failed: {e}", flush=True)
 
 
 @asynccontextmanager
@@ -815,12 +982,21 @@ async def lifespan(app: FastAPI):
         cap = None
     audit_task = None
     cloud_audit_task = None
+    frame_source_task = None
     audio_task = None
     videodb_task = None
 
     if ENABLE_CLOUD_AI and CLOUD_AI_URL:
+        asyncio.create_task(_warmup_cloud_ai())
         cloud_audit_task = asyncio.create_task(cloud_audit_loop())
-        logger.info("Cloud AI visual analysis enabled (model=%s, url=%s)", CLOUD_AI_MODEL, CLOUD_AI_URL)
+        if FRAME_SOURCE == "live_ffmpeg":
+            frame_source_task = asyncio.create_task(live_ffmpeg_source_loop())
+        else:
+            frame_source_task = asyncio.create_task(local_yolo_source_loop())
+        logger.info(
+            "Cloud AI visual analysis enabled (model=%s, url=%s, source=%s)",
+            CLOUD_AI_MODEL, CLOUD_AI_URL, FRAME_SOURCE,
+        )
 
     if ENABLE_LOCAL_AUDIT and cap is not None:
         audit_task = asyncio.create_task(local_audit_loop())
@@ -828,16 +1004,9 @@ async def lifespan(app: FastAPI):
     if ENABLE_AUDIO_STT:
         audio_task = asyncio.create_task(audio_transcription_loop())
         logger.info(
-            "Audio STT enabled (model=%s, duration=%.1fs)", OPENAI_STT_MODEL, STT_DURATION_SEC
+            "Audio STT enabled (model=%s, duration=%.1fs)", CLOUD_AI_MODEL, STT_DURATION_SEC
         )
-        if OPENAI_STT_API_KEY:
-            _print_audio("[Rioc] Listening. Speak to the camera; you'll see '[Rioc] Heard: ...' when your speech is transcribed.")
-        else:
-            _print_audio(
-                "[Rioc] Audio STT is ON but no API key found. Create a .env file in the project root with:\n"
-                "  OPENAI_STT_API_KEY=sk-proj-your-key\n"
-                f"  (Project root: {_project_dir})"
-            )
+        _print_audio("[Rioc] Listening. Speak to the camera; you'll see '[Rioc] ...' when speech is processed.")
     if ENABLE_VIDEODB:
         from videodb_integration import run_videodb_eyes
 
@@ -868,6 +1037,12 @@ async def lifespan(app: FastAPI):
             cloud_audit_task.cancel()
             try:
                 await cloud_audit_task
+            except asyncio.CancelledError:
+                pass
+        if frame_source_task is not None:
+            frame_source_task.cancel()
+            try:
+                await frame_source_task
             except asyncio.CancelledError:
                 pass
         if audit_task is not None:
@@ -913,9 +1088,9 @@ class TtsTestRequest(BaseModel):
 @app.post("/tts/test")
 async def tts_test(body: TtsTestRequest):
     """Send arbitrary text to the speaker (used by the AI Guard UI). Bypasses ENABLE_SPEAKER_TTS flag."""
-    if not SPEAKER_URL or not OPENAI_STT_API_KEY:
+    if not SPEAKER_URL or not CLOUD_AI_URL:
         return Response(
-            content="SPEAKER_URL or OPENAI_STT_API_KEY not configured",
+            content="SPEAKER_URL or CLOUD_AI_URL not configured",
             status_code=400,
             media_type="text/plain",
         )
@@ -1064,6 +1239,40 @@ async def analysis():
 async def get_detections():
     """Return detection history (vision + audio), newest first."""
     return {"detections": list(detections)}
+
+
+@app.get("/detections/stream")
+async def detections_stream():
+    """Server-Sent Events stream — pushes each new detection instantly as it happens.
+    On connect, replays existing detections so the client is immediately up to date."""
+    queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+    _sse_subscribers.append(queue)
+
+    async def event_gen():
+        try:
+            # Replay existing detections (oldest first) so client starts with full history
+            for d in reversed(list(detections)):
+                yield f"data: {json.dumps(d)}\n\n"
+            # Push new detections as they arrive; send keepalives to prevent proxy timeouts
+            while True:
+                try:
+                    d = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield f"data: {json.dumps(d)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            try:
+                _sse_subscribers.remove(queue)
+            except ValueError:
+                pass
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/tts/latest.mp3")
