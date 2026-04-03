@@ -48,6 +48,9 @@ OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "openbmb/minicpm-v2.
 AUDIT_INTERVAL_SEC = float(os.environ.get("AUDIT_INTERVAL_SEC", "2.0"))
 # Require this many consecutive non-CLEAR results before firing TTS/log (reduces false positives)
 AUDIT_CONFIRM_FRAMES = int(os.environ.get("AUDIT_CONFIRM_FRAMES", "2"))
+# Minimum seconds between detection alerts (guards _add_detection + TTS fallback from firing
+# every scan cycle). Independent of TTS_COOLDOWN_SEC, which only applies when SPEAKER_URL is set.
+ALERT_COOLDOWN_SEC = float(os.environ.get("ALERT_COOLDOWN_SEC", "30.0"))
 # Size to resize frames to before sending to cloud AI (smaller = faster inference, default 320x320)
 AUDIT_AI_FRAME_SIZE = int(os.environ.get("AUDIT_AI_FRAME_SIZE", "320"))
 
@@ -67,7 +70,7 @@ CLOUD_AI_API_KEY = os.environ.get("CLOUD_AI_API_KEY", "token-minicpm-v45")
 CLOUD_AI_MODEL = os.environ.get("CLOUD_AI_MODEL", "openbmb/MiniCPM-V-4_5")
 
 AUDIT_SYSTEM_PROMPT = (
-    "You are the Rioc Sentinel, an automated audio-broadcast security system. Do not use labels like 'Visual Data' or 'Warning'. Do not use headers or bullet points. Speak only the final warning text as it should be heard over a loudspeaker. Be cold, concise, and observational. Do not identify as an AI."
+    "You are the Rioc Sentinel, an automated audio-broadcast security system. Do not use labels like 'Visual Data' or 'Warning'. Do not use headers or bullet points. Speak only the final warning text as it should be heard over a loudspeaker. Be cold, concise, and observational. Do not identify as an AI. Always respond in English only."
 )
 AUDIT_USER_PROMPT = (
     """Examine this image.
@@ -75,7 +78,11 @@ AUDIT_USER_PROMPT = (
 No clearly visible person → respond with the single word: CLEAR
 If unsure whether a shape is a person → respond CLEAR
 
-Person clearly visible → respond with a one-sentence spoken warning addressed directly to them. Mention their clothing. Cold, authoritative tone. Speak as if over a loudspeaker. Example: "You in the grey hoodie — this area is restricted. Leave immediately."
+Person clearly visible → respond with a one-sentence spoken warning addressed directly TO THEM. Mention their clothing. Cold, authoritative tone. Speak as if over a loudspeaker.
+
+The message must tell the person to leave — it is not a command to a security team. Do not say things like "secure the area" or "detain the subject". Speak directly to the person you see.
+
+Good examples: "You in the grey hoodie — this area is restricted. Leave immediately." / "You by the door — you are not authorized to be here. Exit now."
 
 Do not describe. Do not use passive detection language. Speak to the person."""
 )
@@ -131,6 +138,10 @@ latest_analysis: str = ""  # Latest Cloud AI vision output (non-CLEAR)
 _tts_active: bool = False
 _last_tts_time: float = 0.0
 
+# Detection-level alert cooldown: gates _add_detection + the TTS fallback path so that
+# alerts never fire more often than ALERT_COOLDOWN_SEC regardless of TTS or speaker state.
+_last_alert_time: float = 0.0
+
 # Detection history: list of {timestamp, type, text} newest-first
 detections: deque = deque(maxlen=100)
 
@@ -139,6 +150,9 @@ _sse_subscribers: list[asyncio.Queue] = []
 
 # Frames that passed person detection, waiting for vLLM — size 1 ensures freshest frame is always used
 _detection_frame_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+
+# AI Guard conversation manager (lazy-imported and initialized in lifespan)
+_conv_manager = None
 
 
 def _add_detection(detection_type: str, text: str) -> None:
@@ -277,8 +291,7 @@ def _yolo_person_in_frame(frame: np.ndarray) -> bool:
     if not detected:
         # Log best confidence seen so we can tune the threshold
         best = max((float(box.conf) for r in results for box in r.boxes), default=0.0)
-        if best > 0.05:
-            print(f"[YOLO] Best conf={best:.2f} (threshold={YOLO_CONFIDENCE}) — not detected", flush=True)
+        print(f"[YOLO] Best conf={best:.2f} (threshold={YOLO_CONFIDENCE}) — not detected", flush=True)
     return detected
 
 FRAME_SIZE = (640, 640)
@@ -571,36 +584,73 @@ async def _guarded_play(audio_bytes: bytes, audio_format: str = "wav", force: bo
                             break
                 except Exception as e:
                     pass  # Try next path
-        # Generic IP speaker (Fanvil/LINKVIL and similar): upload to /cgi-bin/mediaupload, play via /api/spkplay
+        # Generic IP speaker (CS20/LINKVIL and similar)
         if not played and SPEAKER_TYPE == "ipspk":
             try:
-                _print_audio("[Rioc] Trying IP speaker upload (/cgi-bin/mediaupload + /api/spkplay)")
+                def _ipspk_result_ok(resp) -> bool:
+                    """CS20 returns HTTP 200 even on failure — check the JSON result field."""
+                    try:
+                        return resp.json().get("result", -1) == 0
+                    except Exception:
+                        return resp.status_code < 400
+
+                # ── Strategy 1: upload to userfile1 then play via /api/play?file=userfile1 ──
+                # Requires "Play File Enable" checked on Alarm → Http URL in speaker admin UI.
+                _print_audio("[Rioc] Trying IP speaker upload + /api/play?file=userfile1")
+
+                # Upload to idx=1 → stored as /app/flash/userfile1.mp3 → API name "userfile1"
                 async with httpx.AsyncClient(verify=False) as client:
                     r = await client.post(
                         f"{SPEAKER_URL}/cgi-bin/mediaupload?idx=1",
                         files={"upload1": ("tts.mp3", audio_bytes, "audio/mpeg")},
-                        auth=auth,
-                        timeout=30.0,
+                        auth=auth, timeout=30.0,
                     )
+                _print_audio(f"[Rioc] ipspk upload idx=1: {r.status_code} {r.text[:80]}")
+
                 if r.status_code < 400:
+                    # Verify the file was actually written by checking musicfile list
+                    try:
+                        async with httpx.AsyncClient(verify=False) as client:
+                            mg = await client.get(f"{SPEAKER_URL}/cgi-bin/CGI", params={"config": "musicfile.get"}, auth=auth, timeout=10.0)
+                        _print_audio(f"[Rioc] musicfile after upload: {mg.text[mg.text.find('userfile1'):mg.text.find('userfile1')+80] if 'userfile1' in mg.text else mg.text[:120]}")
+                    except Exception:
+                        pass
+                    # Stop any current playback, then wait for file write to complete
                     async with httpx.AsyncClient(verify=False) as client:
-                        r2 = await client.get(
-                            f"{SPEAKER_URL}/api/spkplay",
-                            params={"action": "start", "fileid": 1},
-                            auth=auth,
-                            timeout=10.0,
+                        await client.get(f"{SPEAKER_URL}/api/play", params={"action": "stop"}, auth=auth, timeout=5.0)
+                    await asyncio.sleep(1.0)
+                    async with httpx.AsyncClient(verify=False) as client:
+                        rp = await client.get(
+                            f"{SPEAKER_URL}/api/play",
+                            params={"action": "start", "file": "userfile1", "mode": "once", "volume": 80},
+                            auth=auth, timeout=10.0,
                         )
-                    if r2.status_code < 400:
-                        _print_audio("[Rioc] Speaker OK (ipspk upload+spkplay)")
+                    _print_audio(f"[Rioc] ipspk /api/play file=userfile1: {rp.status_code} {rp.text[:120]}")
+                    if _ipspk_result_ok(rp):
+                        _print_audio("[Rioc] Speaker OK (ipspk upload+play userfile1)")
                         played = True
-                    else:
-                        _print_audio(f"[Rioc] ipspk spkplay: {r2.status_code} {r2.text[:80]}")
                 else:
                     _print_audio(f"[Rioc] ipspk upload failed: {r.status_code} {r.text[:80]}")
+
+                # ── Strategy 2: stream from URL (speaker fetches from Rioc) ──────────────────
+                # Fallback if upload+play fails. TTS_PUBLIC_URL must be reachable from the speaker.
+                if not played and TTS_PUBLIC_URL:
+                    tts_url = f"{TTS_PUBLIC_URL}/tts/latest.mp3"
+                    async with httpx.AsyncClient(verify=False) as client:
+                        rs = await client.get(
+                            f"{SPEAKER_URL}/api/play",
+                            params={"action": "startstream", "stream": tts_url},
+                            auth=auth, timeout=15.0,
+                        )
+                    _print_audio(f"[Rioc] ipspk startstream {tts_url}: {rs.status_code} {rs.text[:120]}")
+                    if _ipspk_result_ok(rs):
+                        _print_audio(f"[Rioc] Speaker OK (ipspk startstream)")
+                        played = True
+
             except Exception as e:
                 _print_audio(f"[Rioc] ipspk error: {e}")
 
-        if not played and SPEAKER_TYPE != "axis":
+        if not played and SPEAKER_TYPE not in ("axis", "ipspk"):
             paths_to_try = [SPEAKER_PLAY_PATH] + [p for p in SPEAKER_PLAY_FALLBACK_PATHS if p != SPEAKER_PLAY_PATH]
             last_err = ""
             for path in paths_to_try:
@@ -792,14 +842,21 @@ async def local_audit_loop() -> None:
             print(f"[Visual Audit] Request failed: {e}")
 
 
+_raw_frame_dims_logged = False
+
 def _get_raw_ai_frame() -> np.ndarray | None:
     """Grab one frame and resize to AUDIT_AI_FRAME_SIZE. Returns numpy array (for YOLO or encoding)."""
+    global _raw_frame_dims_logged
     with cap_lock:
         if cap is None or not cap.isOpened():
             return None
         ret, frame = cap.read()
     if not ret or frame is None:
         return None
+    if not _raw_frame_dims_logged:
+        h, w = frame.shape[:2]
+        print(f"[YOLO] Raw frame from camera: {w}x{h}, resizing to {AUDIT_AI_FRAME_SIZE}x{AUDIT_AI_FRAME_SIZE}", flush=True)
+        _raw_frame_dims_logged = True
     return cv2.resize(frame, (AUDIT_AI_FRAME_SIZE, AUDIT_AI_FRAME_SIZE), interpolation=cv2.INTER_LINEAR)
 
 
@@ -914,16 +971,26 @@ async def cloud_audit_loop() -> None:
                 print(f"[Cloud AI] (frame {consecutive_detections}/{AUDIT_CONFIRM_FRAMES}) {msg}", flush=True)
                 if consecutive_detections >= AUDIT_CONFIRM_FRAMES:
                     consecutive_detections = 0
-                    global latest_analysis
+                    global latest_analysis, _last_alert_time
                     latest_analysis = msg
-                    _add_detection("vision", msg)
-                    # Use audio bytes from model directly — skip separate TTS generation
-                    wav_b64 = audio_data.get("data") or ""
-                    if wav_b64:
-                        asyncio.create_task(_guarded_play(base64.b64decode(wav_b64), "wav"))
+                    now = time.monotonic()
+                    if now - _last_alert_time < ALERT_COOLDOWN_SEC:
+                        remaining = ALERT_COOLDOWN_SEC - (now - _last_alert_time)
+                        print(f"[Rioc] Alert cooldown — {remaining:.0f}s remaining", flush=True)
                     else:
-                        # No audio in response — fall back to text TTS
-                        asyncio.create_task(_speak_through_speaker(msg))
+                        _last_alert_time = now
+                        _add_detection("vision", msg)
+
+                        # Always speak the detection message via TTS — conv manager runs in parallel
+                        # for the interactive conversation, but we need audio out immediately.
+                        wav_b64 = audio_data.get("data") or ""
+                        if wav_b64:
+                            asyncio.create_task(_guarded_play(base64.b64decode(wav_b64), "wav"))
+                        else:
+                            asyncio.create_task(_speak_through_speaker(msg))
+                        # Also start conversation manager if available and idle
+                        if _conv_manager is not None and not _conv_manager.is_active():
+                            asyncio.create_task(_conv_manager.on_person_detected(jpeg_bytes))
         except Exception as e:
             print(f"[Cloud AI] Request failed: {e}", flush=True)
 
@@ -975,7 +1042,7 @@ async def _warmup_cloud_ai() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Open camera on startup, release on shutdown. Optionally start local audit + audio STT + VideoDB tasks."""
-    global cap, latest_transcript
+    global cap, latest_transcript, _conv_manager
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         logger.error("Failed to open camera (index 0)")
@@ -1030,6 +1097,27 @@ async def lifespan(app: FastAPI):
         logger.info("VideoDB eyes and ears enabled (batch=%ds)", VIDEODB_BATCH_SEC)
     if ENABLE_SPEAKER_TTS and SPEAKER_URL:
         _print_audio(f"[Rioc] Speaker TTS enabled: {SPEAKER_URL}")
+
+    # Initialize AI Guard conversation manager
+    try:
+        from conversation_manager import ConversationManager, set_manager
+        from db import init_db as _init_db
+
+        async def _play_for_conv(wav_bytes: bytes, fmt: str = "wav") -> None:
+            await _guarded_play(wav_bytes, fmt, force=True)
+
+        _conv_manager = ConversationManager(
+            play_audio_fn=_play_for_conv,
+            get_frame_fn=lambda: _get_raw_ai_frame() and _get_ai_frame(),
+            speak_text_fn=lambda text: _speak_through_speaker(text, force=True),
+        )
+        set_manager(_conv_manager)
+        await _init_db()
+        logger.info("AI Guard conversation manager initialized")
+    except Exception as _conv_err:
+        logger.warning("AI Guard conversation manager failed to initialize: %s", _conv_err)
+        _conv_manager = None
+
     try:
         yield
     finally:
@@ -1088,9 +1176,15 @@ class TtsTestRequest(BaseModel):
 @app.post("/tts/test")
 async def tts_test(body: TtsTestRequest):
     """Send arbitrary text to the speaker (used by the AI Guard UI). Bypasses ENABLE_SPEAKER_TTS flag."""
-    if not SPEAKER_URL or not CLOUD_AI_URL:
+    if not SPEAKER_URL:
         return Response(
-            content="SPEAKER_URL or CLOUD_AI_URL not configured",
+            content="SPEAKER_URL not configured — apply configuration first",
+            status_code=400,
+            media_type="text/plain",
+        )
+    if not OPENAI_STT_API_KEY:
+        return Response(
+            content="OPENAI_STT_API_KEY not set — TTS requires an OpenAI API key",
             status_code=400,
             media_type="text/plain",
         )
@@ -1333,3 +1427,129 @@ async def speaker_test_bell():
         return {"status": r.status_code, "message": "Triggered bell1. Did you hear it?"}
     except Exception as e:
         return {"status": 500, "message": str(e)}
+
+
+# ── AI Guard Conversation Endpoints ───────────────────────────────────────────
+
+class ConversationStartRequest(BaseModel):
+    cameraId: str | None = None
+    systemPrompt: str | None = None
+    maxTurns: int | None = None
+
+
+class ConversationRespondRequest(BaseModel):
+    audioBase64: str  # WAV bytes, base64-encoded
+
+
+@app.post("/conversation/start")
+async def conversation_start(body: ConversationStartRequest):
+    """Manually start a conversation (e.g. triggered by the UI or YOLO detection)."""
+    if _conv_manager is None:
+        return Response(content="ConversationManager not initialized", status_code=503, media_type="text/plain")
+    if _conv_manager.is_active():
+        return {"ok": False, "reason": "conversation already active", "status": _conv_manager.get_status()}
+    if _conv_manager.cooldown_remaining() > 0:
+        return {"ok": False, "reason": "cooldown", "cooldown_remaining": _conv_manager.cooldown_remaining()}
+
+    # Reconfigure manager if overrides provided
+    if body.systemPrompt is not None:
+        _conv_manager.system_prompt = body.systemPrompt
+    if body.maxTurns is not None:
+        _conv_manager.max_turns = body.maxTurns
+    if body.cameraId is not None:
+        _conv_manager.camera_id = body.cameraId
+
+    jpeg_bytes = await asyncio.to_thread(_get_ai_frame)
+    if not jpeg_bytes:
+        return Response(content="Camera not available", status_code=503, media_type="text/plain")
+
+    asyncio.create_task(_conv_manager.on_person_detected(jpeg_bytes))
+    return {"ok": True}
+
+
+@app.post("/conversation/respond")
+async def conversation_respond(body: ConversationRespondRequest):
+    """Feed mic audio into the active conversation turn."""
+    if _conv_manager is None:
+        return Response(content="ConversationManager not initialized", status_code=503, media_type="text/plain")
+    if not _conv_manager.is_active():
+        return {"ok": False, "reason": "no active conversation"}
+    wav_bytes = base64.b64decode(body.audioBase64)
+    asyncio.create_task(_conv_manager.respond(wav_bytes))
+    return {"ok": True}
+
+
+@app.get("/conversation/status")
+async def conversation_status():
+    """Return current conversation state, turn count, and transcript so far."""
+    if _conv_manager is None:
+        return {"state": "IDLE", "turn_count": 0, "turns": [], "cooldown_remaining": 0}
+    return _conv_manager.get_status()
+
+
+@app.get("/conversation/stream")
+async def conversation_stream():
+    """SSE stream of conversation events (state changes, new turns, ended)."""
+    try:
+        from conversation_manager import register_sse_listener, unregister_sse_listener
+    except ImportError:
+        return Response(content="ConversationManager not available", status_code=503, media_type="text/plain")
+
+    q = register_sse_listener()
+
+    async def event_generator():
+        try:
+            # Send current status immediately on connect
+            if _conv_manager is not None:
+                status = _conv_manager.get_status()
+                yield f"data: {json.dumps({'type': 'status', **status})}\n\n"
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=30.0)
+                    yield f"data: {json.dumps(event)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            unregister_sse_listener(q)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.get("/conversations")
+async def list_conversations(limit: int = 50, offset: int = 0):
+    """Return paginated conversation history."""
+    try:
+        from db import get_conversations
+        rows = await get_conversations(limit=limit, offset=offset)
+        return {"conversations": rows, "limit": limit, "offset": offset}
+    except Exception as e:
+        return Response(content=str(e), status_code=500, media_type="text/plain")
+
+
+@app.get("/conversations/{conversation_id}")
+async def get_conversation_detail(conversation_id: int):
+    """Return full transcript for a specific conversation."""
+    try:
+        from db import get_conversation
+        conv = await get_conversation(conversation_id)
+        if conv is None:
+            return Response(content="Not found", status_code=404, media_type="text/plain")
+        return conv
+    except Exception as e:
+        return Response(content=str(e), status_code=500, media_type="text/plain")
+
+
+@app.post("/conversation/configure")
+async def conversation_configure(body: ConversationStartRequest):
+    """Update conversation manager settings without starting a conversation."""
+    if _conv_manager is None:
+        return Response(content="ConversationManager not initialized", status_code=503, media_type="text/plain")
+    if body.systemPrompt is not None:
+        _conv_manager.system_prompt = body.systemPrompt
+    if body.maxTurns is not None:
+        _conv_manager.max_turns = body.maxTurns
+    if body.cameraId is not None:
+        _conv_manager.camera_id = body.cameraId
+    return {"ok": True}

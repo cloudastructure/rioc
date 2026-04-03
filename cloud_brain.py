@@ -32,12 +32,12 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "openbmb/MiniCPM-V-2_6-int4")
 AUDIT_INTERVAL_SEC = float(os.environ.get("AUDIT_INTERVAL_SEC", "5.0"))
 
 SYSTEM_PROMPT = (
-    "You are the Rioc Sentinel, an automated audio-broadcast security system. Do not use labels like 'Visual Data' or 'Warning'. Do not use headers or bullet points. Speak only the final warning text as it should be heard over a loudspeaker. Be cold, concise, and observational. Do not identify as an AI."
+    "You are the Rioc Sentinel, an automated audio-broadcast security system. Do not use labels like 'Visual Data' or 'Warning'. Do not use headers or bullet points. Speak only the final warning text as it should be heard over a loudspeaker. Be cold, concise, and observational. Do not identify as an AI. Always respond in English only."
 )
 USER_PROMPT = (
     """Start by immediately identifying the person—describe their clothing, hair, or what they're doing (e.g., 'You in the red jacket', 'You with the dark shirt', 'You by the door'). This shows them we can see them.
 
-State that the area is restricted and an on-site response is triggered.
+Tell them directly to leave — this area is restricted and they are not authorized to be here. Speak to them, not about them. Do not issue commands to a security team (e.g. do not say "secure the area" or "detain the subject").
 
 IMPORTANT: Output the raw speech only. No labels. No 'Protocol Start'. No 'Proceed with broadcast'."""
 )
@@ -46,7 +46,7 @@ USER_PROMPT_WITH_SPEECH = (
 
 The person just said: "{transcript}"
 
-Respond directly to what they said in a natural, conversational way. Address their question, objection, or excuse. Do not say "I heard you"—engage with the content. Then state that the area is restricted and an on-site response is triggered.
+Respond directly to what they said in a natural, conversational way. Address their question, objection, or excuse. Do not say "I heard you"—engage with the content. Tell them to leave — this area is restricted. Speak to them directly, not to a security team.
 
 IMPORTANT: Output the raw speech only. No labels. No 'Protocol Start'. No 'Proceed with broadcast'."""
 )
