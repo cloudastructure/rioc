@@ -399,6 +399,28 @@ def _wav_to_mp3(wav_bytes: bytes) -> bytes | None:
     return None
 
 
+def _resample_for_speaker(audio_bytes: bytes, sample_rate: int = 16000) -> bytes | None:
+    """Re-encode audio to mono MP3 at the given sample rate for embedded speaker compatibility.
+    CS20 and similar embedded speakers often can't play 24kHz stereo MP3 from streams."""
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", "pipe:0",
+                "-ac", "1", "-ar", str(sample_rate),
+                "-f", "mp3", "-q:a", "4",
+                "pipe:1",
+            ],
+            input=audio_bytes,
+            capture_output=True,
+            timeout=30,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            return proc.stdout
+    except Exception as e:
+        logger.warning("Resample for speaker failed: %s", e)
+    return None
+
+
 def _mp3_to_mulaw(mp3_bytes: bytes, sample_rate: int = 8000) -> bytes | None:
     """Convert MP3 (or WAV) to G.711 μ-law at 8kHz - format talk.js sends to speaker."""
     try:
@@ -470,8 +492,16 @@ async def _guarded_play(audio_bytes: bytes, audio_format: str = "wav", force: bo
                 return
         else:
             mp3_bytes = audio_bytes
-        latest_tts_audio = mp3_bytes
-        audio_bytes = mp3_bytes  # alias for the delivery code below
+        # Re-encode to 16kHz mono for embedded speaker stream compatibility.
+        # OpenAI TTS outputs 24kHz stereo; many embedded speakers can't decode that when streaming.
+        resampled = await asyncio.to_thread(_resample_for_speaker, mp3_bytes)
+        if resampled:
+            _print_audio(f"[Rioc] Resampled {len(mp3_bytes)}→{len(resampled)} bytes (16kHz mono) for speaker stream")
+            latest_tts_audio = resampled
+        else:
+            _print_audio("[Rioc] Resample failed — serving original MP3")
+            latest_tts_audio = mp3_bytes
+        audio_bytes = mp3_bytes  # delivery paths (upload, AXIS) still use original quality
         auth = (SPEAKER_USER, SPEAKER_PASS) if SPEAKER_USER else None
         played = False
         # Try AXIS VAPIX transmit (AXIS C1310-E and similar AXIS network speakers)
@@ -503,7 +533,7 @@ async def _guarded_play(audio_bytes: bytes, audio_format: str = "wav", force: bo
                 except Exception as e:
                     _print_audio(f"[Rioc] AXIS transmit error ({ct}): {type(e).__name__}: {e}")
         # Try WebSocket (Fanvil/LINKVIL speakers use wss://.../webtwowayaudio)
-        if SPEAKER_WS_URL and not played and SPEAKER_TYPE not in ("axis", "ipspk"):
+        if SPEAKER_WS_URL and not played and SPEAKER_TYPE not in ("axis",):
             try:
                 import ssl
                 import websockets
@@ -594,58 +624,30 @@ async def _guarded_play(audio_bytes: bytes, audio_format: str = "wav", force: bo
                     except Exception:
                         return resp.status_code < 400
 
-                # ── Strategy 1: upload to userfile1 then play via /api/play?file=userfile1 ──
-                # Requires "Play File Enable" checked on Alarm → Http URL in speaker admin UI.
-                _print_audio("[Rioc] Trying IP speaker upload + /api/play?file=userfile1")
-
-                # Upload to idx=1 → stored as /app/flash/userfile1.mp3 → API name "userfile1"
-                async with httpx.AsyncClient(verify=False) as client:
-                    r = await client.post(
-                        f"{SPEAKER_URL}/cgi-bin/mediaupload?idx=1",
-                        files={"upload1": ("tts.mp3", audio_bytes, "audio/mpeg")},
-                        auth=auth, timeout=30.0,
-                    )
-                _print_audio(f"[Rioc] ipspk upload idx=1: {r.status_code} {r.text[:80]}")
-
-                if r.status_code < 400:
-                    # Verify the file was actually written by checking musicfile list
+                if TTS_PUBLIC_URL:
+                    tts_url = f"{TTS_PUBLIC_URL}/tts/latest.mp3?t={int(time.monotonic() * 1000)}"
+                    # stopstream (not stop) cleanly exits the CS20 streaming loop without crashing HTTP
                     try:
                         async with httpx.AsyncClient(verify=False) as client:
-                            mg = await client.get(f"{SPEAKER_URL}/cgi-bin/CGI", params={"config": "musicfile.get"}, auth=auth, timeout=10.0)
-                        _print_audio(f"[Rioc] musicfile after upload: {mg.text[mg.text.find('userfile1'):mg.text.find('userfile1')+80] if 'userfile1' in mg.text else mg.text[:120]}")
+                            await client.get(f"{SPEAKER_URL}/api/play", params={"action": "stopstream"}, auth=auth, timeout=5.0)
+                        await asyncio.sleep(0.3)
                     except Exception:
                         pass
-                    # Stop any current playback, then wait for file write to complete
-                    async with httpx.AsyncClient(verify=False) as client:
-                        await client.get(f"{SPEAKER_URL}/api/play", params={"action": "stop"}, auth=auth, timeout=5.0)
-                    await asyncio.sleep(1.0)
-                    async with httpx.AsyncClient(verify=False) as client:
-                        rp = await client.get(
-                            f"{SPEAKER_URL}/api/play",
-                            params={"action": "start", "file": "userfile1", "mode": "once", "volume": 80},
-                            auth=auth, timeout=10.0,
-                        )
-                    _print_audio(f"[Rioc] ipspk /api/play file=userfile1: {rp.status_code} {rp.text[:120]}")
-                    if _ipspk_result_ok(rp):
-                        _print_audio("[Rioc] Speaker OK (ipspk upload+play userfile1)")
-                        played = True
-                else:
-                    _print_audio(f"[Rioc] ipspk upload failed: {r.status_code} {r.text[:80]}")
-
-                # ── Strategy 2: stream from URL (speaker fetches from Rioc) ──────────────────
-                # Fallback if upload+play fails. TTS_PUBLIC_URL must be reachable from the speaker.
-                if not played and TTS_PUBLIC_URL:
-                    tts_url = f"{TTS_PUBLIC_URL}/tts/latest.mp3"
                     async with httpx.AsyncClient(verify=False) as client:
                         rs = await client.get(
                             f"{SPEAKER_URL}/api/play",
-                            params={"action": "startstream", "stream": tts_url},
+                            params={"action": "startstream", "stream": tts_url, "volume": 80},
                             auth=auth, timeout=15.0,
                         )
-                    _print_audio(f"[Rioc] ipspk startstream {tts_url}: {rs.status_code} {rs.text[:120]}")
+                    _print_audio(f"[Rioc] ipspk startstream: {rs.status_code} {rs.text[:200]}")
                     if _ipspk_result_ok(rs):
-                        _print_audio(f"[Rioc] Speaker OK (ipspk startstream)")
+                        # Schedule stopstream after audio finishes to prevent CS20 looping
+                        est_duration = max(2.0, len(latest_tts_audio) / 4000) + 2.0
+                        asyncio.create_task(_ipspk_stopstream_after(est_duration))
+                        _print_audio(f"[Rioc] Speaker OK (ipspk startstream, stopstream in {est_duration:.1f}s)")
                         played = True
+                else:
+                    _print_audio("[Rioc] ipspk: TTS_PUBLIC_URL not set")
 
             except Exception as e:
                 _print_audio(f"[Rioc] ipspk error: {e}")
@@ -680,6 +682,22 @@ async def _guarded_play(audio_bytes: bytes, audio_format: str = "wav", force: bo
         _print_audio(f"[Rioc] Speaker error: {e}")
     finally:
         _tts_active = False
+
+
+async def _ipspk_stopstream_after(delay: float) -> None:
+    """Stop CS20 stream after delay seconds to prevent looping on a static file URL."""
+    await asyncio.sleep(delay)
+    try:
+        auth = (SPEAKER_USER, SPEAKER_PASS) if SPEAKER_USER else None
+        async with httpx.AsyncClient(verify=False) as client:
+            await client.get(
+                f"{SPEAKER_URL}/api/play",
+                params={"action": "stopstream"},
+                auth=auth, timeout=5.0,
+            )
+        _print_audio(f"[Rioc] ipspk stopstream (after {delay:.1f}s)")
+    except Exception as e:
+        _print_audio(f"[Rioc] ipspk stopstream error: {e}")
 
 
 async def _speak_through_speaker(text: str, force: bool = False) -> None:
