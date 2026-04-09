@@ -5,17 +5,53 @@ Calls a remote MiniCPM-o 4.5 endpoint (vLLM / HuggingFace-served) with:
   - optional audio input (WAV bytes as base64)
   - conversation history
 Returns response text + generated audio WAV bytes.
+
+Falls back to CLOUD_AI_URL (port 8100) when MINICPMO_URL (port 8101) is unavailable.
 """
 import base64
+import logging
 import os
 from typing import Any
 
 import httpx
 
+logger = logging.getLogger(__name__)
+
 MINICPMO_URL = os.environ.get("MINICPMO_URL", "http://172.16.128.41:8101/")
 MINICPMO_API_KEY = os.environ.get("MINICPMO_API_KEY", "token-minicpm-o45")
 MINICPMO_MODEL = os.environ.get("MINICPMO_MODEL", "openbmb/MiniCPM-o-2_6")
 MINICPMO_TIMEOUT = float(os.environ.get("MINICPMO_TIMEOUT", "60.0"))
+
+# Fallback: detection server (port 8100) — same model family, always available
+_FALLBACK_URL = (os.environ.get("CLOUD_AI_URL") or "").rstrip("/")
+_FALLBACK_KEY = os.environ.get("CLOUD_AI_API_KEY", MINICPMO_API_KEY)
+_FALLBACK_MODEL = os.environ.get("CLOUD_AI_MODEL", MINICPMO_MODEL)
+
+
+async def _post_completions(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict,
+    messages: list[dict[str, Any]],
+    model: str,
+) -> httpx.Response:
+    """POST to /v1/chat/completions with audio modalities; retry text-only on 405."""
+    resp = await client.post(
+        url, headers=headers,
+        json={
+            "model": model,
+            "modalities": ["text", "audio"],
+            "audio": {"voice": "default", "format": "wav"},
+            "messages": messages,
+            "max_tokens": 200,
+        },
+    )
+    if resp.status_code == 405:
+        resp = await client.post(
+            url, headers=headers,
+            json={"model": model, "messages": messages, "max_tokens": 200},
+        )
+    return resp
 
 
 async def chat(
@@ -28,6 +64,7 @@ async def chat(
 
     conversation_history is a list of {"role": "user"|"assistant", "content": ...} dicts
     representing prior turns. The current frame/audio are appended as the latest user turn.
+    Falls back to CLOUD_AI_URL when MINICPMO_URL returns an error.
     """
     # Build the current user message content
     b64_image = base64.standard_b64encode(jpeg_bytes).decode("ascii")
@@ -52,27 +89,21 @@ async def chat(
         {"role": "user", "content": content},
     ]
 
-    base_url = MINICPMO_URL.rstrip("/")
-    url = f"{base_url}/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {MINICPMO_API_KEY}"}
+    primary_url = f"{MINICPMO_URL.rstrip('/')}/v1/chat/completions"
+    primary_headers = {"Authorization": f"Bearer {MINICPMO_API_KEY}"}
 
     async with httpx.AsyncClient(timeout=MINICPMO_TIMEOUT) as client:
-        resp = await client.post(
-            url, headers=headers,
-            json={
-                "model": MINICPMO_MODEL,
-                "modalities": ["text", "audio"],
-                "audio": {"voice": "default", "format": "wav"},
-                "messages": messages,
-                "max_tokens": 200,
-            },
-        )
-        # 405 means the server doesn't support audio modalities — retry text-only
-        if resp.status_code == 405:
-            resp = await client.post(
-                url, headers=headers,
-                json={"model": MINICPMO_MODEL, "messages": messages, "max_tokens": 200},
+        resp = await _post_completions(client, primary_url, primary_headers, messages, MINICPMO_MODEL)
+
+        if not resp.is_success and _FALLBACK_URL:
+            logger.info(
+                "[minicpmo] Primary endpoint returned %d — falling back to %s",
+                resp.status_code, _FALLBACK_URL,
             )
+            fallback_url = f"{_FALLBACK_URL}/v1/chat/completions"
+            fallback_headers = {"Authorization": f"Bearer {_FALLBACK_KEY}"}
+            resp = await _post_completions(client, fallback_url, fallback_headers, messages, _FALLBACK_MODEL)
+
         resp.raise_for_status()
 
     data = resp.json()

@@ -112,15 +112,18 @@ class ConversationManager:
         system_prompt: str | None = None,
         max_turns: int | None = None,
         speak_text_fn: Callable[[str], Awaitable[None]] | None = None,
+        transcribe_fn: Callable[[bytes], Awaitable[str | None]] | None = None,
     ):
         """
         play_audio_fn:  async (wav_bytes, format) → None  (calls _guarded_play with force=True)
         get_frame_fn:   sync  () → jpeg_bytes | None      (called in thread)
         speak_text_fn:  async (text) → None               (OpenAI TTS fallback when VLM returns no audio)
+        transcribe_fn:  async (wav_bytes) → str | None    (OpenAI Whisper transcription of person's audio)
         """
         self.play_audio_fn = play_audio_fn
         self.get_frame_fn = get_frame_fn
         self.speak_text_fn = speak_text_fn
+        self.transcribe_fn = transcribe_fn
         self.camera_id = camera_id
         self.system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
         self.max_turns = max_turns if max_turns is not None else CONVERSATION_MAX_TURNS
@@ -154,10 +157,12 @@ class ConversationManager:
             "cooldown_remaining": self.cooldown_remaining(),
         }
 
-    async def on_person_detected(self, jpeg_bytes: bytes) -> None:
+    async def on_person_detected(self, jpeg_bytes: bytes, initial_text: str | None = None) -> None:
         """Called by YOLO detection pipeline when a person is confirmed.
 
         Starts a new conversation if not already active and cooldown elapsed.
+        initial_text: the detection alert message already spoken aloud — logged as the
+        first GUARD turn so the Conversation Log always shows at least the initial warning.
         """
         async with self._lock:
             if self._active:
@@ -167,7 +172,7 @@ class ConversationManager:
                 return
             self._active = True
 
-        await self._run_conversation(jpeg_bytes)
+        await self._run_conversation(jpeg_bytes, initial_text=initial_text)
 
     async def respond(self, audio_bytes: bytes) -> None:
         """Feed mic audio into the current conversation turn.
@@ -181,7 +186,7 @@ class ConversationManager:
 
     # ── Internal flow ─────────────────────────────────────────────────────────
 
-    async def _run_conversation(self, jpeg_bytes: bytes) -> None:
+    async def _run_conversation(self, jpeg_bytes: bytes, initial_text: str | None = None) -> None:
         """Full conversation lifecycle: init → turns → close."""
         AUDIO_SAVE_DIR.mkdir(parents=True, exist_ok=True)
         await init_db()
@@ -194,7 +199,14 @@ class ConversationManager:
         self._set_state(ConversationState.WARNING)
 
         try:
-            await self._do_turn(jpeg_bytes)
+            if initial_text:
+                # The initial detection message was already spoken aloud by the Cloud AI.
+                # Log it as GUARD turn 1 and skip _do_turn so we don't speak a second
+                # opening message — go straight to listening for the person's reply.
+                await self._log_initial_turn(initial_text)
+            else:
+                # No pre-spoken message: let MiniCPM-o generate the opening turn.
+                await self._do_turn(jpeg_bytes)
 
             if ENABLE_REACTIVE_CONVERSATION:
                 while self._active and self.turn_count < self.max_turns:
@@ -203,6 +215,17 @@ class ConversationManager:
             logger.exception("[ConvMgr] Conversation error: %s", exc)
         finally:
             await self._end_conversation()
+
+    async def _log_initial_turn(self, text: str) -> None:
+        """Log the Cloud AI detection message as the first GUARD turn (already played aloud)."""
+        timestamp = _now()
+        turn = ConversationTurn("GUARD", text, timestamp, audio_path=None)
+        self.turns.append(turn)
+        self.turn_count += 1
+        self.history.append({"role": "assistant", "content": text})
+        await add_turn(self.conversation_id, "GUARD", text, timestamp, None)
+        _broadcast({"type": "turn", "turn": turn.to_dict(), "state": self.state})
+        logger.info("[ConvMgr] GUARD (initial): %s", text)
 
     async def _do_turn(self, jpeg_bytes: bytes) -> None:
         """Send frame (+ optional prior context) to MiniCPM-o, play response."""
@@ -272,12 +295,19 @@ class ConversationManager:
             self._active = False
             return
 
-        # Transcription placeholder: MiniCPM-o will transcribe internally when
-        # audio is included in the next call.  We record the audio file for audit.
         timestamp = _now()
         audio_path = await self._save_audio(audio_bytes, "person", self.turn_count)
-        # Use a placeholder text; the real transcript comes back in MiniCPM-o's response
+
+        # Transcribe person's audio so the log shows what they actually said.
         person_text = "[audio response]"
+        if self.transcribe_fn:
+            try:
+                transcript = await self.transcribe_fn(audio_bytes)
+                if transcript:
+                    person_text = transcript
+            except Exception as exc:
+                logger.warning("[ConvMgr] Transcription failed: %s", exc)
+
         turn = ConversationTurn("PERSON", person_text, timestamp, audio_path)
         self.turns.append(turn)
 
@@ -305,14 +335,16 @@ class ConversationManager:
         ended_at = _now()
         state = self.state
 
-        outcome_map = {
-            ConversationState.FINAL: "Escalated",
-            ConversationState.WARNING: "Unknown",
-            ConversationState.ESCALATING: "Unknown",
-        }
-        outcome = outcome_map.get(state, "Unknown")
-        if self.turn_count > 0 and state not in (ConversationState.FINAL, ConversationState.ESCALATING):
+        # "Left" only when the person actually responded (at least one PERSON turn) and
+        # the conversation ended without escalating — meaning they complied and left.
+        # If only GUARD turns exist (no person response), outcome is Unknown.
+        has_person_response = any(t.speaker == "PERSON" for t in self.turns)
+        if state == ConversationState.FINAL:
+            outcome = "Escalated"
+        elif has_person_response:
             outcome = "Left"
+        else:
+            outcome = "Unknown"
 
         if self.conversation_id is not None:
             await close_conversation(self.conversation_id, ended_at, outcome)
