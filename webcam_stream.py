@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 import wave
 from contextlib import asynccontextmanager
+from enum import Enum
 from urllib.parse import urlparse
 
 import datetime
@@ -974,6 +975,87 @@ YOLO_SCAN_INTERVAL_SEC = float(os.environ.get("YOLO_SCAN_INTERVAL_SEC", "0.25"))
 # Seconds between YOLO scans when no person is present (can be slower to save CPU)
 YOLO_IDLE_INTERVAL_SEC = float(os.environ.get("YOLO_IDLE_INTERVAL_SEC", "0.5"))
 
+# ── Presence-lock state machine ────────────────────────────────────────────────
+# Reduces YOLO poll rate and suppresses new alert/TTS triggers once a conversation
+# is active, then enters a brief cooldown before returning to full-frequency IDLE.
+#
+# IDLE ──(alert fires)──► CONVERSATION_ACTIVE ──(N consecutive no-detects)──► COOLDOWN ──(timer)──► IDLE
+#
+# Tunables:
+PRESENCE_LOCK_REDUCED_FPS = float(os.environ.get("PRESENCE_LOCK_REDUCED_FPS", "1.0"))
+# Drop to this many YOLO polls per second while CONVERSATION_ACTIVE.
+PRESENCE_LOCK_NO_DETECT_FRAMES = int(os.environ.get("PRESENCE_LOCK_NO_DETECT_FRAMES", "5"))
+# Consecutive YOLO frames with no person required to leave CONVERSATION_ACTIVE.
+PRESENCE_LOCK_COOLDOWN_SEC = float(os.environ.get("PRESENCE_LOCK_COOLDOWN_SEC", "10.0"))
+# Seconds to stay in COOLDOWN before returning to IDLE.
+
+
+class PresenceLockState(str, Enum):
+    IDLE = "IDLE"
+    CONVERSATION_ACTIVE = "CONVERSATION_ACTIVE"
+    COOLDOWN = "COOLDOWN"
+
+
+class PresenceLock:
+    """Lightweight state machine that throttles the YOLO loop and suppresses
+    redundant alert triggers while a guard conversation is in progress."""
+
+    def __init__(self) -> None:
+        self.state: PresenceLockState = PresenceLockState.IDLE
+        self._no_detect_count: int = 0
+        self._cooldown_started: float = 0.0
+
+    # ── Transition triggers ──────────────────────────────────────────────────
+
+    def on_conversation_started(self) -> None:
+        """Call when an alert fires and a vLLM conversation begins."""
+        if self.state == PresenceLockState.IDLE:
+            self.state = PresenceLockState.CONVERSATION_ACTIVE
+            self._no_detect_count = 0
+            logger.info("[PresenceLock] IDLE → CONVERSATION_ACTIVE")
+
+    def on_yolo_result(self, person_detected: bool) -> None:
+        """Track consecutive no-detect frames; trigger COOLDOWN when threshold met."""
+        if self.state != PresenceLockState.CONVERSATION_ACTIVE:
+            return
+        if person_detected:
+            self._no_detect_count = 0
+        else:
+            self._no_detect_count += 1
+            logger.debug(
+                "[PresenceLock] No-detect count: %d/%d",
+                self._no_detect_count, PRESENCE_LOCK_NO_DETECT_FRAMES,
+            )
+            if self._no_detect_count >= PRESENCE_LOCK_NO_DETECT_FRAMES:
+                self.state = PresenceLockState.COOLDOWN
+                self._cooldown_started = time.monotonic()
+                logger.info(
+                    "[PresenceLock] CONVERSATION_ACTIVE → COOLDOWN"
+                    " (no person for %d consecutive frames)",
+                    PRESENCE_LOCK_NO_DETECT_FRAMES,
+                )
+
+    def tick(self) -> None:
+        """Check whether the cooldown window has expired; return to IDLE if so."""
+        if self.state == PresenceLockState.COOLDOWN:
+            if time.monotonic() - self._cooldown_started >= PRESENCE_LOCK_COOLDOWN_SEC:
+                self.state = PresenceLockState.IDLE
+                logger.info("[PresenceLock] COOLDOWN → IDLE")
+
+    # ── Queries ──────────────────────────────────────────────────────────────
+
+    def is_idle(self) -> bool:
+        return self.state == PresenceLockState.IDLE
+
+    def yolo_interval(self, person_detected: bool) -> float:
+        """Sleep duration for the YOLO loop: reduced while CONVERSATION_ACTIVE."""
+        if self.state == PresenceLockState.CONVERSATION_ACTIVE:
+            return 1.0 / PRESENCE_LOCK_REDUCED_FPS
+        return YOLO_SCAN_INTERVAL_SEC if person_detected else YOLO_IDLE_INTERVAL_SEC
+
+
+_presence_lock = PresenceLock()
+
 
 async def local_yolo_source_loop() -> None:
     """Continuously grab webcam frames, run YOLO, and enqueue person-detected frames for vLLM.
@@ -986,16 +1068,18 @@ async def local_yolo_source_loop() -> None:
             continue
         if ENABLE_YOLO:
             person_detected = await asyncio.to_thread(_yolo_person_in_frame, frame)
+            _presence_lock.on_yolo_result(person_detected)
+            _presence_lock.tick()
             if not person_detected:
                 print("[YOLO] No person — skipping VLM", flush=True)
-                # Scan less often when no one is present to save CPU
-                await asyncio.sleep(YOLO_IDLE_INTERVAL_SEC)
+                await asyncio.sleep(_presence_lock.yolo_interval(False))
                 continue
+        else:
+            _presence_lock.tick()
         _, jpeg_enc = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-        # On the very first detection of a new presence, play "Attention." immediately
-        # so there is audio feedback before the Cloud AI finishes (~1s later).
+        # Attention chime: only fire from IDLE — skip when already engaged with someone.
         global _attention_chime_pending
-        if _attention_chime_pending:
+        if _attention_chime_pending and _presence_lock.is_idle():
             _attention_chime_pending = False
             asyncio.create_task(_speak_through_speaker("Attention.", chime=True))
         try:
@@ -1003,8 +1087,8 @@ async def local_yolo_source_loop() -> None:
             _detection_frame_queue.put_nowait((jpeg_enc.tobytes(), latest_transcript))
         except asyncio.QueueFull:
             pass  # vLLM still processing — drop, keep scanning
-        # Rate-limit between VLM calls when a person is present
-        await asyncio.sleep(YOLO_SCAN_INTERVAL_SEC)
+        # Throttle scan rate: 1/PRESENCE_LOCK_REDUCED_FPS while CONVERSATION_ACTIVE, else normal.
+        await asyncio.sleep(_presence_lock.yolo_interval(True))
 
 
 async def live_ffmpeg_source_loop() -> None:
@@ -1090,6 +1174,11 @@ async def cloud_audit_loop() -> None:
                     if now - _last_alert_time < ALERT_COOLDOWN_SEC:
                         remaining = ALERT_COOLDOWN_SEC - (now - _last_alert_time)
                         print(f"[Rioc] Alert cooldown — {remaining:.0f}s remaining", flush=True)
+                    elif not _presence_lock.is_idle():
+                        print(
+                            f"[PresenceLock] Alert suppressed — state={_presence_lock.state.value}",
+                            flush=True,
+                        )
                     else:
                         _last_alert_time = now
                         _attention_chime_pending = True  # Reset so next new detection fires chime again
@@ -1098,6 +1187,7 @@ async def cloud_audit_loop() -> None:
                         # Speak via OpenAI TTS (fast) and start conversation manager in parallel
                         asyncio.create_task(_speak_through_speaker(msg))
                         if _conv_manager is not None and not _conv_manager.is_active():
+                            _presence_lock.on_conversation_started()
                             asyncio.create_task(_conv_manager.on_person_detected(jpeg_bytes, initial_text=msg))
         except Exception as e:
             print(f"[Cloud AI] Request failed: {e}", flush=True)
