@@ -1655,6 +1655,12 @@ class ConversationStartRequest(BaseModel):
     maxTurns: int | None = None
 
 
+class PersonDetectedEvent(BaseModel):
+    stream_id: str
+    timestamp: int  # Unix epoch milliseconds
+    frame: str | None = None  # Base64-encoded JPEG; absent if CVR encoding failed
+
+
 class ConversationRespondRequest(BaseModel):
     audioBase64: str  # WAV bytes, base64-encoded
 
@@ -1771,3 +1777,88 @@ async def conversation_configure(body: ConversationStartRequest):
     if body.cameraId is not None:
         _conv_manager.camera_id = body.cameraId
     return {"ok": True}
+
+
+@app.post("/api/person-detected", status_code=202)
+async def person_detected_webhook(body: PersonDetectedEvent):
+    """Receive a person-detection event from live-ffmpeg's RiocHook.
+    Returns 202 immediately; AI analysis and conversation are fired as background tasks."""
+    asyncio.create_task(_handle_person_detected_event(body))
+    return {"ok": True, "stream_id": body.stream_id}
+
+
+async def _handle_person_detected_event(body: PersonDetectedEvent) -> None:
+    """Process a person-detection event from live-ffmpeg.
+    Mirrors the alert flow in cloud_audit_loop() but bypasses AUDIT_CONFIRM_FRAMES
+    since RiocHook already debounces at the source (30 s cooldown in C++)."""
+    global latest_analysis, _last_alert_time, _attention_chime_pending
+
+    # Respect the same cooldown and presence-lock guards as the local loop.
+    now = time.monotonic()
+    if now - _last_alert_time < ALERT_COOLDOWN_SEC:
+        remaining = ALERT_COOLDOWN_SEC - (now - _last_alert_time)
+        print(f"[RiocHook] Alert cooldown — {remaining:.0f}s remaining (stream={body.stream_id})", flush=True)
+        return
+    if not _presence_lock.is_idle():
+        print(f"[RiocHook] Alert suppressed — state={_presence_lock.state.value} (stream={body.stream_id})", flush=True)
+        return
+
+    jpeg_bytes: bytes | None = None
+    if body.frame:
+        try:
+            jpeg_bytes = base64.b64decode(body.frame)
+        except Exception as e:
+            print(f"[RiocHook] Failed to decode frame: {e}", flush=True)
+
+    if jpeg_bytes and ENABLE_CLOUD_AI and CLOUD_AI_URL:
+        # Frame present — ask MiniCPM for a tactical analysis, same as cloud_audit_loop.
+        b64 = base64.standard_b64encode(jpeg_bytes).decode("ascii")
+        full_prompt = AUDIT_SYSTEM_PROMPT + "\n\n" + AUDIT_USER_PROMPT
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{CLOUD_AI_URL}/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {CLOUD_AI_API_KEY}"},
+                    json={
+                        "model": CLOUD_AI_MODEL,
+                        "modalities": ["text"],
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": full_prompt},
+                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                                ],
+                            }
+                        ],
+                        "max_tokens": 600,
+                        "chat_template_kwargs": {"enable_thinking": False},
+                    },
+                    timeout=30.0,
+                )
+            resp.raise_for_status()
+            choice_msg = ((resp.json().get("choices") or [{}])[0].get("message") or {})
+            audio_data = choice_msg.get("audio") or {}
+            raw_text = choice_msg.get("content") or audio_data.get("transcript") or ""
+            msg = _strip_think_tags(raw_text)
+            if not msg or msg.split('\n')[0].strip().upper() == "CLEAR":
+                print(f"[RiocHook] MiniCPM returned CLEAR (stream={body.stream_id})", flush=True)
+                return
+        except Exception as e:
+            print(f"[RiocHook] MiniCPM request failed: {e} — falling back to default prompt", flush=True)
+            msg = "A person has been detected. Please respond."
+    else:
+        # No frame or Cloud AI disabled — use fallback prompt directly.
+        reason = "no frame" if not jpeg_bytes else "Cloud AI disabled"
+        print(f"[RiocHook] {reason} — using fallback prompt (stream={body.stream_id})", flush=True)
+        msg = "A person has been detected. Please respond."
+
+    _last_alert_time = now
+    _attention_chime_pending = True
+    _add_detection("vision", msg)
+    _log_event("ai_alert", msg)
+    latest_analysis = msg
+    asyncio.create_task(_speak_through_speaker(msg))
+    if _conv_manager is not None and not _conv_manager.is_active():
+        _presence_lock.on_conversation_started()
+        asyncio.create_task(_conv_manager.on_person_detected(jpeg_bytes or b"", initial_text=msg))
