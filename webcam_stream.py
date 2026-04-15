@@ -72,9 +72,12 @@ AUDIT_AI_FRAME_SIZE = int(os.environ.get("AUDIT_AI_FRAME_SIZE", "320"))
 ENABLE_YOLO = os.environ.get("ENABLE_YOLO", "1").strip().lower() in ("1", "true", "yes")
 YOLO_MODEL = os.environ.get("YOLO_MODEL", "yolov8n.pt")  # nano model: fast, ~6MB
 YOLO_CONFIDENCE = float(os.environ.get("YOLO_CONFIDENCE", "0.45"))
-# Frame source: "local_yolo" (webcam + local YOLO) or "live_ffmpeg" (subscribe to CVR detections).
-# local_yolo is the default for dev/demo. live_ffmpeg is the production path once the AGX interface is confirmed.
-FRAME_SOURCE = os.environ.get("FRAME_SOURCE", "local_yolo").strip().lower()
+# Frame source controls which person-detection path is active:
+#   "local_yolo" — webcam + local YOLO loop (dev/demo default)
+#   "webhook"    — no local loop; person-detected events arrive via POST /api/person-detected
+#                  (production path when live-ffmpeg RiocHook is the detection source)
+#   "live_ffmpeg"— reserved stub; falls back to local_yolo until AGX interface is wired up
+FRAME_SOURCE = os.environ.get("FRAME_SOURCE", "webhook").strip().lower()
 
 # Optional cloud AI visual analysis (OpenAI-compatible vLLM server)
 ENABLE_CLOUD_AI = os.environ.get("ENABLE_CLOUD_AI", "").strip().lower() in ("1", "true", "yes")
@@ -1265,15 +1268,25 @@ async def lifespan(app: FastAPI):
 
     if ENABLE_CLOUD_AI and CLOUD_AI_URL:
         asyncio.create_task(_warmup_cloud_ai())
-        cloud_audit_task = asyncio.create_task(cloud_audit_loop())
-        if FRAME_SOURCE == "live_ffmpeg":
-            frame_source_task = asyncio.create_task(live_ffmpeg_source_loop())
+        if FRAME_SOURCE == "webhook":
+            # Webhook mode: person-detection events arrive via POST /api/person-detected.
+            # The endpoint calls MiniCPM directly, so neither the frame-source loop nor
+            # cloud_audit_loop (which drains _detection_frame_queue) are needed.
+            logger.info(
+                "Cloud AI visual analysis enabled — webhook mode (model=%s, url=%s). "
+                "Waiting for POST /api/person-detected events; local YOLO loop disabled.",
+                CLOUD_AI_MODEL, CLOUD_AI_URL,
+            )
         else:
-            frame_source_task = asyncio.create_task(local_yolo_source_loop())
-        logger.info(
-            "Cloud AI visual analysis enabled (model=%s, url=%s, source=%s)",
-            CLOUD_AI_MODEL, CLOUD_AI_URL, FRAME_SOURCE,
-        )
+            cloud_audit_task = asyncio.create_task(cloud_audit_loop())
+            if FRAME_SOURCE == "live_ffmpeg":
+                frame_source_task = asyncio.create_task(live_ffmpeg_source_loop())
+            else:
+                frame_source_task = asyncio.create_task(local_yolo_source_loop())
+            logger.info(
+                "Cloud AI visual analysis enabled (model=%s, url=%s, source=%s)",
+                CLOUD_AI_MODEL, CLOUD_AI_URL, FRAME_SOURCE,
+            )
 
     if ENABLE_LOCAL_AUDIT and cap is not None:
         audit_task = asyncio.create_task(local_audit_loop())
