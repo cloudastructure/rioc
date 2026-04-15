@@ -1816,6 +1816,9 @@ async def _handle_person_detected_event(body: PersonDetectedEvent) -> None:
         print(f"[RiocHook] Alert suppressed — state={_presence_lock.state.value} (stream={body.stream_id})", flush=True)
         return
 
+    # Log the raw detection so the yellow YOLO badge appears in the AlertsLog timeline.
+    _log_event("yolo_detected", f"stream={body.stream_id}")
+
     jpeg_bytes: bytes | None = None
     if body.frame:
         try:
