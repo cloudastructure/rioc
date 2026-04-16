@@ -83,7 +83,7 @@ FRAME_SOURCE = os.environ.get("FRAME_SOURCE", "webhook").strip().lower()
 ENABLE_CLOUD_AI = os.environ.get("ENABLE_CLOUD_AI", "").strip().lower() in ("1", "true", "yes")
 CLOUD_AI_URL = (os.environ.get("CLOUD_AI_URL") or "").rstrip("/")
 CLOUD_AI_API_KEY = os.environ.get("CLOUD_AI_API_KEY", "token-minicpm-v45")
-CLOUD_AI_MODEL = os.environ.get("CLOUD_AI_MODEL", "openbmb/MiniCPM-V-4_5")
+CLOUD_AI_MODEL = os.environ.get("CLOUD_AI_MODEL", "openbmb/MiniCPM-o-4_5-awq")
 
 AUDIT_SYSTEM_PROMPT = (
     "You are the Rioc Sentinel, an automated audio-broadcast security system. Do not use labels like 'Visual Data' or 'Warning'. Do not use headers or bullet points. Speak only the final warning text as it should be heard over a loudspeaker. Be cold, concise, and observational. Do not identify as an AI. Always respond in English only."
