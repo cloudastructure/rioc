@@ -72,15 +72,18 @@ AUDIT_AI_FRAME_SIZE = int(os.environ.get("AUDIT_AI_FRAME_SIZE", "320"))
 ENABLE_YOLO = os.environ.get("ENABLE_YOLO", "1").strip().lower() in ("1", "true", "yes")
 YOLO_MODEL = os.environ.get("YOLO_MODEL", "yolov8n.pt")  # nano model: fast, ~6MB
 YOLO_CONFIDENCE = float(os.environ.get("YOLO_CONFIDENCE", "0.45"))
-# Frame source: "local_yolo" (webcam + local YOLO) or "live_ffmpeg" (subscribe to CVR detections).
-# local_yolo is the default for dev/demo. live_ffmpeg is the production path once the AGX interface is confirmed.
-FRAME_SOURCE = os.environ.get("FRAME_SOURCE", "local_yolo").strip().lower()
+# Frame source controls which person-detection path is active:
+#   "local_yolo" — webcam + local YOLO loop (dev/demo default)
+#   "webhook"    — no local loop; person-detected events arrive via POST /api/person-detected
+#                  (production path when live-ffmpeg RiocHook is the detection source)
+#   "live_ffmpeg"— reserved stub; falls back to local_yolo until AGX interface is wired up
+FRAME_SOURCE = os.environ.get("FRAME_SOURCE", "webhook").strip().lower()
 
 # Optional cloud AI visual analysis (OpenAI-compatible vLLM server)
 ENABLE_CLOUD_AI = os.environ.get("ENABLE_CLOUD_AI", "").strip().lower() in ("1", "true", "yes")
 CLOUD_AI_URL = (os.environ.get("CLOUD_AI_URL") or "").rstrip("/")
 CLOUD_AI_API_KEY = os.environ.get("CLOUD_AI_API_KEY", "token-minicpm-v45")
-CLOUD_AI_MODEL = os.environ.get("CLOUD_AI_MODEL", "openbmb/MiniCPM-V-4_5")
+CLOUD_AI_MODEL = os.environ.get("CLOUD_AI_MODEL", "openbmb/MiniCPM-o-4_5-awq")
 
 AUDIT_SYSTEM_PROMPT = (
     "You are the Rioc Sentinel, an automated audio-broadcast security system. Do not use labels like 'Visual Data' or 'Warning'. Do not use headers or bullet points. Speak only the final warning text as it should be heard over a loudspeaker. Be cold, concise, and observational. Do not identify as an AI. Always respond in English only."
@@ -94,6 +97,20 @@ If unsure whether a shape is a person → respond CLEAR
 Person clearly visible → respond with a one-sentence spoken warning addressed directly TO THEM. Mention their clothing. Cold, authoritative tone. Speak as if over a loudspeaker.
 
 The message must tell the person to leave — it is not a command to a security team. Do not say things like "secure the area" or "detain the subject". Speak directly to the person you see.
+
+Good examples: "You in the grey hoodie — this area is restricted. Leave immediately." / "You by the door — you are not authorized to be here. Exit now."
+
+Do not describe. Do not use passive detection language. Speak to the person."""
+)
+
+# Webhook-path prompt: person presence is already confirmed by YOLO/PeopleNet upstream,
+# so skip the CLEAR gate and just describe/address the person.
+AUDIT_WEBHOOK_PROMPT = (
+    """A person has been detected by motion sensors. A camera image is attached.
+
+Respond with a single spoken warning addressed directly TO THEM. Mention their clothing or appearance if visible. Cold, authoritative tone. Speak as if over a loudspeaker.
+
+Tell the person to leave — do not issue commands to a security team. Speak directly to the person.
 
 Good examples: "You in the grey hoodie — this area is restricted. Leave immediately." / "You by the door — you are not authorized to be here. Exit now."
 
@@ -1265,15 +1282,25 @@ async def lifespan(app: FastAPI):
 
     if ENABLE_CLOUD_AI and CLOUD_AI_URL:
         asyncio.create_task(_warmup_cloud_ai())
-        cloud_audit_task = asyncio.create_task(cloud_audit_loop())
-        if FRAME_SOURCE == "live_ffmpeg":
-            frame_source_task = asyncio.create_task(live_ffmpeg_source_loop())
+        if FRAME_SOURCE == "webhook":
+            # Webhook mode: person-detection events arrive via POST /api/person-detected.
+            # The endpoint calls MiniCPM directly, so neither the frame-source loop nor
+            # cloud_audit_loop (which drains _detection_frame_queue) are needed.
+            logger.info(
+                "Cloud AI visual analysis enabled — webhook mode (model=%s, url=%s). "
+                "Waiting for POST /api/person-detected events; local YOLO loop disabled.",
+                CLOUD_AI_MODEL, CLOUD_AI_URL,
+            )
         else:
-            frame_source_task = asyncio.create_task(local_yolo_source_loop())
-        logger.info(
-            "Cloud AI visual analysis enabled (model=%s, url=%s, source=%s)",
-            CLOUD_AI_MODEL, CLOUD_AI_URL, FRAME_SOURCE,
-        )
+            cloud_audit_task = asyncio.create_task(cloud_audit_loop())
+            if FRAME_SOURCE == "live_ffmpeg":
+                frame_source_task = asyncio.create_task(live_ffmpeg_source_loop())
+            else:
+                frame_source_task = asyncio.create_task(local_yolo_source_loop())
+            logger.info(
+                "Cloud AI visual analysis enabled (model=%s, url=%s, source=%s)",
+                CLOUD_AI_MODEL, CLOUD_AI_URL, FRAME_SOURCE,
+            )
 
     if ENABLE_LOCAL_AUDIT and cap is not None:
         audit_task = asyncio.create_task(local_audit_loop())
@@ -1655,6 +1682,12 @@ class ConversationStartRequest(BaseModel):
     maxTurns: int | None = None
 
 
+class PersonDetectedEvent(BaseModel):
+    stream_id: str
+    timestamp: int  # Unix epoch milliseconds
+    frame: str | None = None  # Base64-encoded JPEG; absent if CVR encoding failed
+
+
 class ConversationRespondRequest(BaseModel):
     audioBase64: str  # WAV bytes, base64-encoded
 
@@ -1771,3 +1804,93 @@ async def conversation_configure(body: ConversationStartRequest):
     if body.cameraId is not None:
         _conv_manager.camera_id = body.cameraId
     return {"ok": True}
+
+
+@app.post("/api/person-detected", status_code=202)
+async def person_detected_webhook(body: PersonDetectedEvent):
+    """Receive a person-detection event from live-ffmpeg's RiocHook.
+    Returns 202 immediately; AI analysis and conversation are fired as background tasks."""
+    asyncio.create_task(_handle_person_detected_event(body))
+    return {"ok": True, "stream_id": body.stream_id}
+
+
+async def _handle_person_detected_event(body: PersonDetectedEvent) -> None:
+    """Process a person-detection event from live-ffmpeg.
+    Mirrors the alert flow in cloud_audit_loop() but bypasses AUDIT_CONFIRM_FRAMES
+    since RiocHook already debounces at the source (30 s cooldown in C++)."""
+    global latest_analysis, _last_alert_time, _attention_chime_pending
+
+    # Respect the same cooldown and presence-lock guards as the local loop.
+    now = time.monotonic()
+    if now - _last_alert_time < ALERT_COOLDOWN_SEC:
+        remaining = ALERT_COOLDOWN_SEC - (now - _last_alert_time)
+        print(f"[RiocHook] Alert cooldown — {remaining:.0f}s remaining (stream={body.stream_id})", flush=True)
+        return
+    if not _presence_lock.is_idle():
+        print(f"[RiocHook] Alert suppressed — state={_presence_lock.state.value} (stream={body.stream_id})", flush=True)
+        return
+
+    # Log the raw detection so the yellow YOLO badge appears in the AlertsLog timeline.
+    _log_event("yolo_detected", f"stream={body.stream_id}")
+
+    jpeg_bytes: bytes | None = None
+    if body.frame:
+        try:
+            jpeg_bytes = base64.b64decode(body.frame)
+        except Exception as e:
+            print(f"[RiocHook] Failed to decode frame: {e}", flush=True)
+
+    if jpeg_bytes and ENABLE_CLOUD_AI and CLOUD_AI_URL:
+        # Person presence already confirmed upstream — ask MiniCPM to address them directly.
+        b64 = base64.standard_b64encode(jpeg_bytes).decode("ascii")
+        full_prompt = AUDIT_SYSTEM_PROMPT + "\n\n" + AUDIT_WEBHOOK_PROMPT
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{CLOUD_AI_URL}/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {CLOUD_AI_API_KEY}"},
+                    json={
+                        "model": CLOUD_AI_MODEL,
+                        "modalities": ["text"],
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": full_prompt},
+                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                                ],
+                            }
+                        ],
+                        "max_tokens": 600,
+                        "chat_template_kwargs": {"enable_thinking": False},
+                    },
+                    timeout=30.0,
+                )
+            resp.raise_for_status()
+            choice_msg = ((resp.json().get("choices") or [{}])[0].get("message") or {})
+            audio_data = choice_msg.get("audio") or {}
+            raw_text = choice_msg.get("content") or audio_data.get("transcript") or ""
+            msg = _strip_think_tags(raw_text).strip()
+            if not msg:
+                print(f"[RiocHook] MiniCPM returned empty response — falling back to default prompt", flush=True)
+                msg = "A person has been detected. Please respond."
+            else:
+                print(f"[RiocHook] MiniCPM response (stream={body.stream_id}): {msg}", flush=True)
+        except Exception as e:
+            print(f"[RiocHook] MiniCPM request failed: {e} — falling back to default prompt", flush=True)
+            msg = "A person has been detected. Please respond."
+    else:
+        # No frame or Cloud AI disabled — use fallback prompt directly.
+        reason = "no frame" if not jpeg_bytes else "Cloud AI disabled"
+        print(f"[RiocHook] {reason} — using fallback prompt (stream={body.stream_id})", flush=True)
+        msg = "A person has been detected. Please respond."
+
+    _last_alert_time = now
+    _attention_chime_pending = True
+    _add_detection("vision", msg)
+    _log_event("ai_alert", msg)
+    latest_analysis = msg
+    asyncio.create_task(_speak_through_speaker(msg))
+    if _conv_manager is not None and not _conv_manager.is_active():
+        _presence_lock.on_conversation_started()
+        asyncio.create_task(_conv_manager.on_person_detected(jpeg_bytes or b"", initial_text=msg))
