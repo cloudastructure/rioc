@@ -103,6 +103,20 @@ Good examples: "You in the grey hoodie — this area is restricted. Leave immedi
 Do not describe. Do not use passive detection language. Speak to the person."""
 )
 
+# Webhook-path prompt: person presence is already confirmed by YOLO/PeopleNet upstream,
+# so skip the CLEAR gate and just describe/address the person.
+AUDIT_WEBHOOK_PROMPT = (
+    """A person has been detected by motion sensors. A camera image is attached.
+
+Respond with a single spoken warning addressed directly TO THEM. Mention their clothing or appearance if visible. Cold, authoritative tone. Speak as if over a loudspeaker.
+
+Tell the person to leave — do not issue commands to a security team. Speak directly to the person.
+
+Good examples: "You in the grey hoodie — this area is restricted. Leave immediately." / "You by the door — you are not authorized to be here. Exit now."
+
+Do not describe. Do not use passive detection language. Speak to the person."""
+)
+
 # Optional audio transcription (cloud STT)
 ENABLE_AUDIO_STT = os.environ.get("ENABLE_AUDIO_STT", "").strip().lower() in ("1", "true", "yes")
 OPENAI_STT_API_KEY = os.environ.get("OPENAI_STT_API_KEY") or os.environ.get("OPENAI_API_KEY")
@@ -1827,9 +1841,9 @@ async def _handle_person_detected_event(body: PersonDetectedEvent) -> None:
             print(f"[RiocHook] Failed to decode frame: {e}", flush=True)
 
     if jpeg_bytes and ENABLE_CLOUD_AI and CLOUD_AI_URL:
-        # Frame present — ask MiniCPM for a tactical analysis, same as cloud_audit_loop.
+        # Person presence already confirmed upstream — ask MiniCPM to address them directly.
         b64 = base64.standard_b64encode(jpeg_bytes).decode("ascii")
-        full_prompt = AUDIT_SYSTEM_PROMPT + "\n\n" + AUDIT_USER_PROMPT
+        full_prompt = AUDIT_SYSTEM_PROMPT + "\n\n" + AUDIT_WEBHOOK_PROMPT
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
@@ -1856,10 +1870,12 @@ async def _handle_person_detected_event(body: PersonDetectedEvent) -> None:
             choice_msg = ((resp.json().get("choices") or [{}])[0].get("message") or {})
             audio_data = choice_msg.get("audio") or {}
             raw_text = choice_msg.get("content") or audio_data.get("transcript") or ""
-            msg = _strip_think_tags(raw_text)
-            if not msg or msg.split('\n')[0].strip().upper() == "CLEAR":
-                print(f"[RiocHook] MiniCPM returned CLEAR (stream={body.stream_id})", flush=True)
-                return
+            msg = _strip_think_tags(raw_text).strip()
+            if not msg:
+                print(f"[RiocHook] MiniCPM returned empty response — falling back to default prompt", flush=True)
+                msg = "A person has been detected. Please respond."
+            else:
+                print(f"[RiocHook] MiniCPM response (stream={body.stream_id}): {msg}", flush=True)
         except Exception as e:
             print(f"[RiocHook] MiniCPM request failed: {e} — falling back to default prompt", flush=True)
             msg = "A person has been detected. Please respond."
