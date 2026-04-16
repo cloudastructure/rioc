@@ -1345,7 +1345,7 @@ async def lifespan(app: FastAPI):
 
         _conv_manager = ConversationManager(
             play_audio_fn=_play_for_conv,
-            get_frame_fn=lambda: _get_raw_ai_frame() and _get_ai_frame(),
+            get_frame_fn=lambda: _get_ai_frame() if _get_raw_ai_frame() is not None else None,
             speak_text_fn=lambda text: _speak_through_speaker(text, force=True),
             transcribe_fn=_transcribe_audio,
         )
