@@ -777,6 +777,7 @@ async def _ipspk_stopstream_after(delay: float) -> None:
 async def _transcribe_audio(wav_bytes: bytes) -> str | None:
     """Transcribe WAV bytes using OpenAI Whisper. Used for person-response logging."""
     if not OPENAI_STT_API_KEY:
+        logger.warning("[Transcribe] OPENAI_STT_API_KEY not set — skipping transcription")
         return None
     try:
         import io as _io
@@ -793,10 +794,16 @@ async def _transcribe_audio(wav_bytes: bytes) -> str | None:
             return (result.text or "").strip()
 
         text = await asyncio.to_thread(_do)
-        if text and not _is_stt_hallucination(text):
-            return text
+        logger.info("[Transcribe] Raw Whisper result: %r", text)
+        if not text:
+            logger.warning("[Transcribe] Empty transcript returned")
+            return None
+        if _is_stt_hallucination(text):
+            logger.warning("[Transcribe] Hallucination filter discarded: %r", text)
+            return None
+        return text
     except Exception as exc:
-        logger.warning("[Rioc] Person transcription failed: %s", exc)
+        logger.warning("[Transcribe] Person transcription failed: %s", exc)
     return None
 
 

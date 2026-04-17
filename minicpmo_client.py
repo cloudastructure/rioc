@@ -11,11 +11,22 @@ Falls back to CLOUD_AI_URL (port 8100) when MINICPMO_URL (port 8101) is unavaila
 import base64
 import logging
 import os
+import re
 from typing import Any
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_think_tags(text: str) -> str:
+    """Remove <think>...</think> reasoning blocks returned by MiniCPM-o."""
+    cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+    # Unclosed tag means the model ran out of tokens mid-reasoning — treat as empty.
+    if re.search(r'<think>', cleaned, re.IGNORECASE):
+        return ""
+    return cleaned
+
 
 MINICPMO_URL = os.environ.get("MINICPMO_URL", "http://172.16.128.41:8101/")
 MINICPMO_API_KEY = os.environ.get("MINICPMO_API_KEY", "token-minicpm-o45")
@@ -110,7 +121,7 @@ async def chat(
     choice_msg = ((data.get("choices") or [{}])[0].get("message") or {})
     audio_data = choice_msg.get("audio") or {}
 
-    text = choice_msg.get("content") or audio_data.get("transcript") or ""
+    text = _strip_think_tags(choice_msg.get("content") or audio_data.get("transcript") or "")
 
     wav_out: bytes | None = None
     wav_b64 = audio_data.get("data") or ""
