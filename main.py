@@ -161,12 +161,22 @@ SPEAKER_WS_SAMPLE_RATE = int(os.environ.get("SPEAKER_WS_SAMPLE_RATE", "8000"))
 latest_transcript: str = ""
 latest_tts_audio: bytes = b""  # Served at /tts/latest.mp3 for play-from-URL mode
 latest_analysis: str = ""  # Latest Cloud AI vision output (non-CLEAR)
+# Most recent JPEG available to the conversation manager for turn context.
+# Updated from both the RTSP path (_get_ai_frame) and the webhook path so that
+# conversation turns always see the freshest frame regardless of whether a live
+# camera is configured.
+_latest_conv_frame: bytes | None = None
+
 
 # TTS rate-limiting: one announcement at a time with a cooldown between them.
 # _tts_active is set True before the first await, so asyncio's single-threaded model
 # makes this check+set atomic — no two coroutines can both see it False simultaneously.
 _tts_active: bool = False
 _last_tts_time: float = 0.0
+
+# Pre-generated "Attention." TTS audio — generated once at startup so the first-detection
+# chime plays instantly without a TTS API round-trip on the hot path.
+_attention_audio_mp3: bytes | None = None
 
 # Detection-level alert cooldown: gates _add_detection + the TTS fallback path so that
 # alerts never fire more often than ALERT_COOLDOWN_SEC regardless of TTS or speaker state.
@@ -208,58 +218,63 @@ TTS_PUBLIC_URL = (os.environ.get("TTS_PUBLIC_URL") or "").rstrip("/")
 # Optional: test with a public MP3 URL to verify speaker can play streams (e.g. https://...)
 SPEAKER_TEST_URL = (os.environ.get("SPEAKER_TEST_URL") or "").strip() or None
 
-# Whisper hallucination phrases to ignore (case-insensitive substring match)
-# Comprehensive list of common Whisper video-outro / non-speech hallucinations
-STT_HALLUCINATION_PHRASES = (
-    # English - video outros
-    "thank you for watching",
-    "thanks for watching",
-    "thank you so much",
-    "thank you very much",
-    "for watching",
-    "subscribe",
-    "like and subscribe",
-    "don't forget to subscribe",
-    "please subscribe",
-    "hit the bell",
-    "leave a comment",
-    "let me know in the comments",
-    "see you in the next",
-    "see you next time",
-    "until next time",
-    "bye bye",
-    "peace out",
-    "take care",
-    "goodbye",
-    "subscribe to my channel",
+# Phrases checked as SUBSTRINGS — safe because they cannot appear in real human speech.
+# Event tags, blank-audio markers, URL patterns, and highly specific platform phrases
+# that no person in a security-guard scenario would ever say.
+STT_HALLUCINATION_SUBSTRING = frozenset((
+    # Silent / blank audio markers
+    "[blank_audio]", "(silence)", "[silence]", "(no audio)", "[no audio]",
+    "(no speech)", "[no speech]",
+    # Sound / music event tags
+    "[music]", "(music)", "[applause]", "(applause)", "[laughter]", "(laughter)",
+    "[noise]", "(noise)", "[sound]", "(sound)", "[audio]",
+    # STT prompt echo — Whisper sometimes repeats the prompt text verbatim or as a prefix.
+    # These phrases are specific enough that they cannot appear in real speech.
+    "transcribe only their direct speech",
+    "a person is speaking to a security guard",
+    # URL-shaped outputs on static noise
+    "www.",
+    # Subtitle / caption credit lines
+    "captioned by", "captions by", "closed caption", "auto-generated",
+    "subtitles by", "translated by",
+    # Highly specific video-platform phrases — no plausible security context
+    "thank you for watching", "thanks for watching", "for watching",
+    "subscribe to my channel", "don't forget to subscribe", "like and subscribe",
+    "please subscribe", "hit the bell", "let me know in the comments",
+    "leave a comment", "see you in the next", "see you next time", "until next time",
     "youtube",
-    "end of",
-    "copyright",
-    "all rights reserved",
-    "music by",
-    "sound effects",
-    "translated by",
-    "subtitles by",
-    "subtitles",
-    # Japanese
-    "ありがとう",
-    "視聴",
-    "最後まで",
-    "ございます",
-    # Spanish/Portuguese
-    "gracias por ver",
-    "suscríbete",
-    "inscreva-se",
-    # Other common hallucinations
-    "the end",
-    "fin",
-    "ciao",
-    "adios",
-    "bye",
-    # Whisper echoing our own prompt back
+    # Japanese / Spanish / Portuguese video-outro markers
+    "ありがとう", "視聴", "最後まで", "ございます",
+    "gracias por ver", "suscríbete", "inscreva-se",
+))
+
+# Phrases checked as EXACT / WHOLE-STRING matches only.
+# These words can legitimately appear inside real speech ("I'll say goodbye and leave",
+# "I know the security guard here") so substring matching would produce false positives.
+# A transcript is discarded only when it consists of nothing but one of these phrases.
+STT_HALLUCINATION_EXACT = frozenset((
+    # Whisper echoing the STT prompt back verbatim (full or key fragments)
+    "a person is speaking to a security guard. transcribe only their direct speech.",
+    "a person is speaking to a security guard",
+    "a person is speaking",
+    "transcribe only their direct speech",
     "transcribe only",
     "direct speech",
-)
+    "transcribe",
+    # Farewell / filler words — only discard when the whole transcript is one of these
+    "thank you so much", "thank you very much",
+    "bye bye", "bye",
+    "goodbye", "take care", "peace out",
+    "the end", "fin", "ciao", "adios",
+    # Whisper's language-detection tag on unrecognised audio
+    "foreign",
+    # Platform / metadata words that are hallucinations when alone
+    "subscribe", "copyright", "all rights reserved",
+    "music by", "sound effects", "subtitles", "end of",
+    # Security context word — valid speech but also a common Whisper hallucination
+    # when it echoes the prompt; only reject if the entire transcript is this phrase
+    "security guard",
+))
 
 # Prompt to prime Whisper away from video-outro hallucinations
 STT_PROMPT = "A person is speaking to a security guard. Transcribe only their direct speech."
@@ -278,11 +293,48 @@ def _strip_think_tags(text: str) -> str:
 
 
 def _is_stt_hallucination(text: str) -> bool:
-    """Return True if transcript matches known Whisper hallucination phrases."""
+    """Return True only when the transcript is entirely a hallucination.
+
+    Two-tier matching strategy:
+    - SUBSTRING match for STT_HALLUCINATION_SUBSTRING: event tags, blank-audio
+      markers, and highly specific platform phrases that cannot appear in real
+      speech.  A single occurrence anywhere in the transcript is enough.
+    - EXACT / whole-string match for STT_HALLUCINATION_EXACT: words and phrases
+      that could legitimately appear inside real speech ("I know the security
+      guard", "say goodbye and leave").  The transcript must consist of nothing
+      but the phrase — partial matches are ignored.
+
+    This prevents the filter from discarding real speech that happens to contain
+    a hallucination word as a substring (e.g. "nearby" triggering on "bye", or
+    "I'll be fine" triggering on "fin", or a full sentence being rejected because
+    it mentions "security guard").
+    """
+    import re as _re
     t = text.lower().strip()
+    # Normalised form used for exact comparisons: trailing punctuation removed
+    t_exact = t.rstrip('.!?,;: ')
+
     if not t or len(t) < 8:
-        return True  # Very short outputs are often noise
-    return any(phrase in t for phrase in STT_HALLUCINATION_PHRASES)
+        return True  # Very short outputs are almost always noise
+
+    # Entire output is a bracket / paren event tag, e.g. "[Music]", "(Silence)"
+    if _re.fullmatch(r'[\[(][^\]\)]{1,40}[\])]\.?', t):
+        return True
+
+    # Repeated-segment loop: same phrase (4+ chars) appearing 3+ times consecutively
+    if _re.search(r'(.{4,}?)(?:\s*\1){2,}', t):
+        return True
+
+    # Substring check — safe for phrases that cannot appear in real speech
+    if any(phrase in t for phrase in STT_HALLUCINATION_SUBSTRING):
+        return True
+
+    # Exact / whole-string check — only discard when the full transcript IS this phrase
+    if t_exact in STT_HALLUCINATION_EXACT:
+        return True
+
+    return False
+
 
 
 def _is_audio_silent(wav_bytes: bytes) -> bool:
@@ -525,6 +577,7 @@ async def _guarded_play(audio_bytes: bytes, audio_format: str = "wav", force: bo
             _print_audio(f"[Rioc] TTS cooldown — {remaining:.0f}s remaining")
             return
     if _tts_active:
+        _print_audio(f"[Rioc] _guarded_play: _tts_active=True — dropping call (force={force}, chime={chime}, {len(audio_bytes)}B)")
         return  # Prevent overlap even for forced/chime calls
     _tts_active = True  # Set before first await — atomic in asyncio (no context switch possible)
     if not chime:
@@ -612,8 +665,12 @@ async def _guarded_play(audio_bytes: bytes, audio_format: str = "wav", force: bo
                     # Speaker expects G.711 μ-law at 8kHz (per talk.js: mulawEncode → send)
                     mulaw_bytes = _mp3_to_mulaw(audio_bytes, sample_rate=SPEAKER_WS_SAMPLE_RATE)
                     if mulaw_bytes:
-                        # Send in ~20ms chunks (160 bytes at 8kHz) - matches talk.js buffer flow
-                        chunk_size = (SPEAKER_WS_SAMPLE_RATE // 50)  # 160 bytes
+                        # Send in ~20ms chunks (160 bytes at 8kHz) - matches talk.js buffer flow.
+                        # The loop is real-time paced (sleep 20ms per 20ms chunk) so when the
+                        # last ws.send() returns, the speaker is playing the final chunk.
+                        # _dispatch_audio's finally block clears _speaking_event here, which
+                        # is the precise half-duplex gate that releases the mic listener.
+                        chunk_size = (SPEAKER_WS_SAMPLE_RATE // 50)  # 160 bytes = 20ms at 8kHz
                         first_chunk = True
                         for i in range(0, len(mulaw_bytes), chunk_size):
                             await ws.send(mulaw_bytes[i : i + chunk_size])
@@ -622,7 +679,13 @@ async def _guarded_play(audio_bytes: bytes, audio_format: str = "wav", force: bo
                                 _log_event("speaker_playing", "WebSocket")
                                 first_chunk = False
                             await asyncio.sleep(0.02)
-                        _print_audio("[Rioc] Speaker OK (WebSocket μ-law)")
+                        # ← WebSocket transmission complete: all μ-law bytes sent to speaker.
+                        # For conversation turns (force=True) hold the mic-suppression lock
+                        # until the speaker hardware finishes playing, then add a 2.5s buffer
+                        # to account for the IP speaker's internal audio buffering.
+                        # For fire-and-forget calls (initial alert, etc.) skip the wait so
+                        # the initial detection response is not delayed.
+                        _print_audio(f"[Rioc] WebSocket: last chunk sent ({len(mulaw_bytes)}B) — transmission complete")
                         played = True
                     else:
                         _print_audio("[Rioc] WebSocket: μ-law conversion failed")
@@ -779,6 +842,19 @@ async def _transcribe_audio(wav_bytes: bytes) -> str | None:
     if not OPENAI_STT_API_KEY:
         logger.warning("[Transcribe] OPENAI_STT_API_KEY not set — skipping transcription")
         return None
+
+    # Log raw audio energy so we can tell whether real speech was captured
+    try:
+        with io.BytesIO(wav_bytes) as _ebuf:
+            with wave.open(_ebuf, "rb") as _wf:
+                _samples = np.frombuffer(_wf.readframes(_wf.getnframes()), dtype=np.int16)
+        _rms = float(np.sqrt(np.mean(_samples.astype(np.float64) ** 2)))
+        _peak = int(np.max(np.abs(_samples)))
+        logger.info("[Transcribe] Audio energy — RMS: %.1f  peak: %d  silence_threshold: %.1f  silent: %s",
+                    _rms, _peak, STT_SILENCE_THRESHOLD, _rms < STT_SILENCE_THRESHOLD)
+    except Exception as _e:
+        logger.debug("[Transcribe] Could not compute audio energy: %s", _e)
+
     try:
         import io as _io
 
@@ -813,7 +889,9 @@ async def _speak_through_speaker(text: str, force: bool = False, chime: bool = F
 
     Current backend: OpenAI TTS (model audio output not yet enabled on the vLLM server).
     TODO: switch to _speak_via_model_audio() below once vLLM is started with --enable-audio-output."""
+    _print_audio(f"[Rioc] _speak_through_speaker called — force={force} len={len(text)} _tts_active={_tts_active}")
     if not text or len(text) > 500:
+        _print_audio(f"[Rioc] _speak_through_speaker: skipping — text empty or too long ({len(text)} chars)")
         return
     if not OPENAI_STT_API_KEY:
         _print_audio("[Rioc] TTS skipped: OPENAI_STT_API_KEY not set")
@@ -988,11 +1066,13 @@ def _get_raw_ai_frame() -> np.ndarray | None:
 
 def _get_ai_frame() -> bytes | None:
     """Grab one frame and resize to AUDIT_AI_FRAME_SIZE for cloud AI (smaller = faster inference)."""
+    global _latest_conv_frame
     frame = _get_raw_ai_frame()
     if frame is None:
         return None
     _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-    return jpeg.tobytes()
+    _latest_conv_frame = jpeg.tobytes()
+    return _latest_conv_frame
 
 
 YOLO_SCAN_INTERVAL_SEC = float(os.environ.get("YOLO_SCAN_INTERVAL_SEC", "0.25"))
@@ -1342,6 +1422,21 @@ async def lifespan(app: FastAPI):
     if ENABLE_SPEAKER_TTS and SPEAKER_URL:
         _print_audio(f"[Rioc] Speaker TTS enabled: {SPEAKER_URL}")
 
+    # Pre-generate "Attention." TTS so the first-detection chime plays instantly.
+    global _attention_audio_mp3
+    if OPENAI_STT_API_KEY:
+        try:
+            def _gen_attention():
+                from openai import OpenAI as _OpenAI
+                resp = _OpenAI(api_key=OPENAI_STT_API_KEY).audio.speech.create(
+                    model=OPENAI_TTS_MODEL, voice=OPENAI_TTS_VOICE, input="Attention."
+                )
+                return resp.content
+            _attention_audio_mp3 = await asyncio.to_thread(_gen_attention)
+            logger.info("[Rioc] Pre-generated Attention. audio (%d bytes)", len(_attention_audio_mp3))
+        except Exception as _e:
+            logger.warning("[Rioc] Failed to pre-generate Attention. audio: %s", _e)
+
     # Initialize AI Guard conversation manager
     try:
         from conversation_manager import ConversationManager, set_manager
@@ -1352,7 +1447,7 @@ async def lifespan(app: FastAPI):
 
         _conv_manager = ConversationManager(
             play_audio_fn=_play_for_conv,
-            get_frame_fn=lambda: _get_ai_frame() if _get_raw_ai_frame() is not None else None,
+            get_frame_fn=lambda: _get_ai_frame() or _latest_conv_frame,
             speak_text_fn=lambda text: _speak_through_speaker(text, force=True),
             transcribe_fn=_transcribe_audio,
         )
@@ -1470,7 +1565,12 @@ async def _probe_rtsp(url: str) -> bool:
 
 def _open_capture(url: str) -> cv2.VideoCapture:
     """Open a VideoCapture in a thread (only called after ffprobe confirms reachability)."""
-    return cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    # Minimise the decode buffer so cap.read() always returns the most recent frame.
+    # Without this, RTSP buffers accumulate during long listening windows (up to 20s)
+    # and conversation turns receive frames from the start of that window, not the end.
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
 
 
 @app.post("/configure")
@@ -1840,12 +1940,22 @@ async def _handle_person_detected_event(body: PersonDetectedEvent) -> None:
     # Log the raw detection so the yellow YOLO badge appears in the AlertsLog timeline.
     _log_event("yolo_detected", f"stream={body.stream_id}")
 
+    global _latest_conv_frame
     jpeg_bytes: bytes | None = None
     if body.frame:
         try:
             jpeg_bytes = base64.b64decode(body.frame)
+            _latest_conv_frame = jpeg_bytes  # keep cache fresh for conversation turns
         except Exception as e:
             print(f"[RiocHook] Failed to decode frame: {e}", flush=True)
+
+    # Immediately announce presence so the person hears something while MiniCPM processes.
+    # Use the pre-generated audio if available (no TTS round-trip); fall back to live TTS.
+    # Store the task so we can await its completion before the main alert plays.
+    if _attention_audio_mp3:
+        _attention_task = asyncio.create_task(_guarded_play(_attention_audio_mp3, "mp3", chime=True))
+    else:
+        _attention_task = asyncio.create_task(_speak_through_speaker("Attention.", chime=True))
 
     if jpeg_bytes and ENABLE_CLOUD_AI and CLOUD_AI_URL:
         # Person presence already confirmed upstream — ask MiniCPM to address them directly.
@@ -1897,7 +2007,14 @@ async def _handle_person_detected_event(body: PersonDetectedEvent) -> None:
     _add_detection("vision", msg)
     _log_event("ai_alert", msg)
     latest_analysis = msg
-    asyncio.create_task(_speak_through_speaker(msg))
+    # Ensure Attention. has finished + a short gap before the main alert so the
+    # speaker doesn't bleed into the mic while listening for a person's response.
+    try:
+        await _attention_task
+    except Exception:
+        pass
+    await asyncio.sleep(0.5)
+    await _speak_through_speaker(msg)
     if _conv_manager is not None and not _conv_manager.is_active():
         _presence_lock.on_conversation_started()
         asyncio.create_task(_conv_manager.on_person_detected(jpeg_bytes or b"", initial_text=msg))
