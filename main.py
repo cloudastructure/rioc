@@ -1066,13 +1066,11 @@ def _get_raw_ai_frame() -> np.ndarray | None:
 
 def _get_ai_frame() -> bytes | None:
     """Grab one frame and resize to AUDIT_AI_FRAME_SIZE for cloud AI (smaller = faster inference)."""
-    global _latest_conv_frame
     frame = _get_raw_ai_frame()
     if frame is None:
         return None
     _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-    _latest_conv_frame = jpeg.tobytes()
-    return _latest_conv_frame
+    return jpeg.tobytes()
 
 
 YOLO_SCAN_INTERVAL_SEC = float(os.environ.get("YOLO_SCAN_INTERVAL_SEC", "0.25"))
@@ -1447,7 +1445,7 @@ async def lifespan(app: FastAPI):
 
         _conv_manager = ConversationManager(
             play_audio_fn=_play_for_conv,
-            get_frame_fn=lambda: _get_ai_frame() or _latest_conv_frame,
+            get_frame_fn=lambda: _latest_conv_frame,
             speak_text_fn=lambda text: _speak_through_speaker(text, force=True),
             transcribe_fn=_transcribe_audio,
         )
