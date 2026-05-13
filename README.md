@@ -1,121 +1,197 @@
-# Rioc
+# Rioc — AI Guard Backend
 
-Webcam streaming over HTTP and an Ollama vision test (Rioc persona).
+Automated AI security guard service. Detects people via camera (local YOLO or external webhook), analyzes frames with a vision LLM (MiniCPM-o / MiniCPM-V), and conducts two-way voice conversations with detected intruders through an IP speaker.
+
+Built with **FastAPI** (Python). Runs as a single process with background tasks for vision analysis, audio transcription, and conversation management.
+
+## Architecture
+
+```
+                          ┌─────────────────────────┐
+                          │   vLLM Server (GPU)      │
+                          │   MiniCPM-o / MiniCPM-V  │
+                          │   OpenAI-compatible API   │
+                          └────────▲──────────────────┘
+                                   │ HTTPS
+┌──────────┐  webhook/   ┌────────┴──────────────────┐    WebSocket/HTTP     ┌────────────┐
+│ CVR /    ├────────────►│   Rioc (this service)      ├────────────────────►│ IP Speaker  │
+│ Camera   │  RTSP       │   FastAPI on :8000         │                     │ (Fanvil)    │
+└──────────┘             └────────┬──────────────────┘                     └────────────┘
+                                  │ HTTPS
+                          ┌───────▼───────────────────┐
+                          │   OpenAI API               │
+                          │   STT (Whisper / gpt-4o)   │
+                          │   TTS (tts-1)              │
+                          └────────────────────────────┘
+```
 
 ## Prerequisites
 
-- Python 3.x
-- Camera (default index 0)
-- **ffmpeg** (for Speaker TTS: `brew install ffmpeg`)
-- For **vision_test**: local [Ollama](https://ollama.ai) with `llama3.2-vision` (e.g. `ollama run llama3.2-vision`)
+- **Python 3.12+**
+- **ffmpeg** — audio format conversion for speaker TTS (`brew install ffmpeg` / `apt install ffmpeg`)
+- **Microphone** — for two-way conversation (optional; can use IP speaker's built-in mic via USB)
+
+## External Services
+
+| Service | Required? | Purpose | Notes |
+|---------|-----------|---------|-------|
+| **vLLM server** (self-hosted) | Yes | Vision LLM inference (MiniCPM-o-4_5 or MiniCPM-V-2_6) | OpenAI-compatible API. See [DEPLOY_AWS.md](DEPLOY_AWS.md) for GPU setup |
+| **OpenAI API** | Yes (for audio) | STT via Whisper/gpt-4o-transcribe, TTS via tts-1 | Requires `OPENAI_STT_API_KEY` |
+| **SQLite** | Auto | Conversation history (`ai_guard.db`, local file) | No setup needed — created automatically |
+| **Ollama** | Optional | Local vision analysis (dev/demo fallback) | Only when `ENABLE_LOCAL_AUDIT=1` |
+| **VideoDB** | Optional | Real-time video/audio indexing | Only when `ENABLE_VIDEODB=1` |
+| **IP Speaker** (Fanvil CS20 etc.) | Optional | Loudspeaker output + mic input | WebSocket G.711 or HTTP play |
+
+**No Redis, no external SQL database, no message queue.**
 
 ## Install
 
-From the `rioc/` directory:
-
 ```bash
+cd rioc/
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+## Configuration
+
+Copy the example env file and fill in values:
+
+```bash
+cp .env.example .env
+```
+
+### Required Environment Variables
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `OPENAI_STT_API_KEY` | OpenAI API key for STT and TTS | `sk-proj-...` |
+| `CLOUD_AI_URL` | vLLM server base URL (with `/v1`) | `http://172.16.128.41:8100/v1` |
+| `CLOUD_AI_API_KEY` | API key for vLLM server | `token-minicpm-v45` |
+
+### Optional Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENABLE_CLOUD_AI` | `""` (off) | Set `1` to enable cloud vision analysis |
+| `CLOUD_AI_MODEL` | `openbmb/MiniCPM-o-4_5-awq` | Model served by vLLM |
+| `FRAME_SOURCE` | `webhook` | Person detection source: `webhook`, `local_yolo`, or `live_ffmpeg` |
+| `CAMERA_RTSP_URL` | `""` | RTSP stream URL (if using local camera) |
+| `ENABLE_LOCAL_AUDIT` | `""` (off) | Set `1` for local Ollama vision audit |
+| `ENABLE_AUDIO_STT` | `""` (off) | Set `1` for microphone transcription |
+| `ENABLE_SPEAKER_TTS` | `""` (off) | Set `1` to output TTS through IP speaker |
+| `ENABLE_VIDEODB` | `""` (off) | Set `1` for VideoDB integration |
+| `SPEAKER_URL` | `""` | IP speaker base URL (e.g. `https://192.168.10.183`) |
+| `SPEAKER_WS_URL` | derived | WebSocket URL for speaker two-way audio |
+| `SPEAKER_USER` / `SPEAKER_PASS` | `""` | Speaker auth credentials |
+| `MINICPMO_URL` | `http://172.16.128.41:8101/` | MiniCPM-o conversation endpoint (port 8101) |
+| `MINICPMO_API_KEY` | `token-minicpm-o45` | API key for MiniCPM-o conversation server |
+| `AUDIO_INPUT_DEVICE` | system default | Mic device index or name substring (e.g. `Fanvil`) |
+| `AUDIT_INTERVAL_SEC` | `2.0` | Seconds between vision audit cycles |
+| `AUDIT_AI_FRAME_SIZE` | `320` | Frame resize before sending to cloud AI |
+| `ENABLE_YOLO` | `1` | YOLO person pre-filter (reduces LLM calls) |
+| `YOLO_CONFIDENCE` | `0.45` | YOLO detection confidence threshold |
+| `ALERT_COOLDOWN_SEC` | `30.0` | Min seconds between detection alerts |
+| `TTS_COOLDOWN_SEC` | `20.0` | Min seconds between TTS announcements |
+| `CONVERSATION_MAX_TURNS` | `6` | Max conversation turns before ending |
+| `CONVERSATION_COOLDOWN_SEC` | `20.0` | Cooldown between conversations |
+| `TTS_PUBLIC_URL` | `""` | Public URL for speaker to fetch TTS audio (for play-from-URL mode) |
+| `ENABLE_LOCAL_PLAYBACK` | `""` (off) | Play TTS through Mac speakers (testing) |
+
 ## Run
 
-### Webcam stream
-
-Stream the webcam at 640x640, 70% JPEG (MJPEG) for local or cloud consumption:
-
 ```bash
-uvicorn webcam_stream:app --host 0.0.0.0 --port 8000
+source .venv/bin/activate
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Then open http://localhost:8000 or http://localhost:8000/video in a browser.
+### Production (webhook mode — default)
 
-**Optional: Local Visual Audit** — Run the same Visual Audit (tactical analyst, MiniCPM-V 2.6) in the same process:
-
-1. Have Ollama running with the model: `ollama run openbmb/minicpm-v2.6` (once).
-2. Enable the audit and start the stream:
+The default `FRAME_SOURCE=webhook` mode expects person-detection events from an external CVR system via `POST /api/person-detected`. No local camera or YOLO loop is needed.
 
 ```bash
-ENABLE_LOCAL_AUDIT=1 uvicorn webcam_stream:app --host 0.0.0.0 --port 8000
+ENABLE_CLOUD_AI=1 \
+ENABLE_AUDIO_STT=1 \
+ENABLE_SPEAKER_TTS=1 \
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Audit results print in the server console every few seconds.
+### Development (local YOLO)
 
-**Optional: Listening (audio STT)** — Let the guard “hear” as well as see:
+Uses a local camera and YOLO for person detection:
 
 ```bash
-ENABLE_AUDIO_STT=1 OPENAI_STT_API_KEY=sk-your-key uvicorn webcam_stream:app --host 0.0.0.0 --port 8000
+FRAME_SOURCE=local_yolo \
+CAMERA_RTSP_URL=rtsp://... \
+ENABLE_CLOUD_AI=1 \
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-The app will capture microphone audio, send it to OpenAI’s STT (`whisper-1` by default), and expose the latest transcript at `GET /transcript`. The local Visual Audit and Cloud Brain can incorporate this transcript into their tactical warnings.
+## API Endpoints
 
-Optional env: `OLLAMA_URL` (default `http://localhost:11434`), `OLLAMA_VISION_MODEL` (default `openbmb/minicpm-v2.6`), `AUDIT_INTERVAL_SEC` (default `5.0`), `ENABLE_AUDIO_STT` (enable/disable), `OPENAI_STT_MODEL` (default `whisper-1`), `STT_SAMPLE_RATE`, `STT_DURATION_SEC`, `STT_GAP_SEC`.
+### Core
 
-**Optional: VideoDB eyes and ears** — Use [VideoDB](https://docs.videodb.io/pages/getting-started/quickstart) for real-time transcript + visual/audio indexing:
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/` | HTML status page |
+| `GET` | `/video` | MJPEG video stream |
+| `GET` | `/transcript` | Latest audio transcript |
+| `GET` | `/analysis` | Latest cloud AI vision analysis |
 
-```bash
-ENABLE_VIDEODB=1 VIDEODB_API_KEY=your-key uvicorn webcam_stream:app --host 0.0.0.0 --port 8000
-```
+### Detections & Events
 
-With no RTSP URLs set, Rioc uses VideoDB's demo streams so you can try it immediately. For your own webcam/mic: run `mediamtx mediamtx.yml` (the config defines `cam` and `mic` paths), then FFmpeg to publish, ngrok TCP to expose, and set `VIDEODB_RTSP_VIDEO` / `VIDEODB_RTSP_AUDIO` in `.env`. See `scripts/videodb_rtsp.sh`.
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/detections` | Recent detection history (JSON array) |
+| `GET` | `/detections/stream` | SSE stream of real-time detection events |
+| `GET` | `/events` | In-memory event log (last 500 events) |
 
-**Optional: Speaker TTS** — Rioc speaks through an IP speaker:
+### Conversations (AI Guard two-way voice)
 
-Add to `.env`: `SPEAKER_URL`, `SPEAKER_USER`, `SPEAKER_PASS`. Then:
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/conversation/start` | Start a new conversation manually |
+| `POST` | `/conversation/respond` | Inject a text response into active conversation |
+| `GET` | `/conversation/status` | Current conversation state |
+| `GET` | `/conversation/stream` | SSE stream of conversation turns |
+| `POST` | `/conversation/configure` | Update system prompt / max turns at runtime |
+| `GET` | `/conversations` | List past conversations (from SQLite) |
+| `GET` | `/conversations/{id}` | Get a conversation with all turns |
 
-```bash
-ENABLE_SPEAKER_TTS=1 ENABLE_LOCAL_AUDIT=1 ENABLE_AUDIO_STT=1 uvicorn webcam_stream:app --host 0.0.0.0 --port 8000
-```
+### Webhooks & Integration
 
-Rioc’s responses (to speech and Visual Audit) are converted to speech via OpenAI TTS and sent to the speaker. 
-**Fanvil LINKVIL CS20 (and similar)** — Uses WebSocket at `wss://<speaker-ip>:8000/webtwowayaudio`. Add `SPEAKER_WS_URL=wss://192.168.10.183:8000/webtwowayaudio` to `.env`. The app streams TTS as **G.711 μ-law at 8 kHz** (same format as the dashboard's talk test). Requires **ffmpeg**: `brew install ffmpeg`.
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/person-detected` | Webhook: receive person-detection events (with JPEG frame) |
+| `POST` | `/api/frame-update` | Push a camera frame update |
+| `POST` | `/configure` | Reconfigure camera RTSP URL at runtime |
 
-**Use the speaker for both input and output** — When the Fanvil (or similar) is connected via USB, it appears as a Mac audio device. Set `AUDIO_INPUT_DEVICE=Fanvil` (or `AUDIO_INPUT_DEVICE=1` if it's the second input) in `.env` so Rioc listens through the speaker's mic instead of the Mac mic. For VideoDB's FFmpeg mic stream, use the numeric index: `AUDIO_INPUT_DEVICE=1` (find indices with `ffmpeg -f avfoundation -list_devices true -i ""`).
+### Speaker & TTS
 
-**Other speakers / Speaker can't reach your Mac (firewall)?** Use **Cloudflare Tunnel** (no interstitial; ngrok free tier blocks API clients):
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/tts/test` | Test TTS through speaker |
+| `GET` | `/tts/latest.mp3` | Latest generated TTS audio file |
+| `GET` | `/speaker-test` | Test speaker connectivity |
+| `GET` | `/speaker-diagnostic` | Speaker connection diagnostics |
+| `GET` | `/speaker-test-bell` | Play test bell sound on speaker |
 
-1. Install cloudflared: `brew install cloudflared`
-2. In one terminal, run the app: `uvicorn webcam_stream:app --host 0.0.0.0 --port 8000`
-3. In another terminal: `cloudflared tunnel --url http://localhost:8000`
-4. Copy the HTTPS URL (e.g. `https://xxx-xxx-xxx.trycloudflare.com`)
-5. In `.env`, set: `TTS_PUBLIC_URL=https://xxx-xxx-xxx.trycloudflare.com`
-6. Restart the app. The speaker will fetch TTS from the tunnel (no firewall changes needed).
+## Data Storage
 
-   **Note:** Quick tunnel URLs change when you restart cloudflared—update `TTS_PUBLIC_URL` each time.
+- **`ai_guard.db`** — SQLite database (auto-created in the project root). Stores conversation history and turns. No migrations needed; tables are created on first run.
+- **`audio_logs/`** — Directory for saved audio recordings from conversations (auto-created).
 
-### Vision test (Rioc)
+## Files
 
-Capture frames and send them to Ollama with the Rioc persona:
+| File | Purpose |
+|------|---------|
+| `main.py` | FastAPI app, endpoints, YOLO detection, TTS/speaker, background loops |
+| `conversation_manager.py` | Two-way voice conversation state machine (WARNING → ESCALATING → FINAL) |
+| `minicpmo_client.py` | MiniCPM-o API client (vision + audio, with fallback) |
+| `mic_listener.py` | VAD-gated microphone capture (WebRTC VAD) |
+| `db.py` | SQLite schema and CRUD for conversations/turns |
+| `vision_test.py` | Standalone Ollama vision test script |
 
-```bash
-python vision_test.py
-```
+## Cloud Brain (AWS deployment)
 
-**Note:** Both apps use the same camera (index 0). Do not run the webcam stream and vision test at the same time on one machine if they share the device, or the camera may be unavailable to one of them.
-
-### Cloud Brain (Visual Audit on AWS)
-
-**cloud_brain.py** runs on **AWS**. See **[DEPLOY_AWS.md](DEPLOY_AWS.md)** for the full deployment guide. It pulls frames from the Mac’s MJPEG stream and sends them to vLLM (MiniCPM-V-2_6) via an OpenAI-compatible API for a “Visual Audit.”
-
-**Requirements:**
-
-1. **vLLM** running on AWS serving **openbmb/MiniCPM-V-2_6** (e.g. `vllm serve openbmb/MiniCPM-V-2_6` with the appropriate vision/chat template).
-2. The **Mac stream** reachable at `http://<MY_MAC_IP>:8000/video` (run the webcam stream on the Mac with `uvicorn webcam_stream:app --host 0.0.0.0 --port 8000` and ensure the AWS instance can reach the Mac’s IP).
-
-**Environment variables:**
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `MAC_IP` | Mac’s IP (stream at `http://<MAC_IP>:8000/video`) | `localhost` |
-| `STREAM_URL` | Full stream base URL; overrides `MAC_IP` if set | `http://<MAC_IP>:8000` |
-| `VLLM_BASE_URL` | vLLM OpenAI-compatible API base (e.g. `http://<vllm-host>:8000/v1`) | `http://localhost:8000/v1` |
-| `AUDIT_INTERVAL_SEC` | Seconds between audits | `5.0` |
-| `OPENAI_API_KEY` | API key for vLLM (use `EMPTY` if none) | `EMPTY` |
-| `TRANSCRIPT_URL` | URL for latest transcript JSON (default `<STREAM_URL>/transcript`) | derived |
-
-**Run:**
-
-```bash
-# On AWS EC2 (after vLLM is running, .env has STREAM_URL and OPENAI_API_KEY)
-pip install -r requirements-cloud_brain.txt
-python cloud_brain.py
-```
+For deploying the vision LLM (vLLM) on AWS or RunPod GPU instances, see **[DEPLOY_AWS.md](DEPLOY_AWS.md)**.
