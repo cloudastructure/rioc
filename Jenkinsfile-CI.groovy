@@ -20,11 +20,27 @@ pipeline {
     environment {
         APP_NAME = "rioc"
         GROOVY_SCRIPTS_DIR = "scripts/groovy"
-        IMAGE_TAG = sh (returnStdout: true, script: "git log -n 1 --pretty=format:'%h'").trim()
         GCE_ENVIRONMENT = "dev-dc-03"
     }
 
     stages {
+        stage('checkout-app') {
+            steps {
+                // Override the branch from job-config SCM with the `branch` parameter
+                // so manual builds can target any branch. IMAGE_TAG is computed after
+                // this so it reflects the requested branch, not the implicit checkout.
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${params.branch}"]],
+                    extensions: scm.extensions,
+                    userRemoteConfigs: scm.userRemoteConfigs
+                ])
+                script {
+                    env.IMAGE_TAG = sh(returnStdout: true, script: "git log -n 1 --pretty=format:'%h'").trim()
+                }
+            }
+        }
+
         stage('show-env') {
             steps {
                 sh "ls -all"
