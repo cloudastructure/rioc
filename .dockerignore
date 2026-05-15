@@ -1,0 +1,15 @@
+.git
+__pycache__/
+*.pyc
+venv/
+.env.example
+.env.cloud_brain.example
+.continue/
+logs/
+data/
+*.db
+*.sqlite3
+*.log
+*.mp3
+*.wav
+*.ogg
