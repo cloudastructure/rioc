@@ -10,15 +10,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_ROOT_USER_ACTION=ignore \
     UMASK=0022
 
-# Minimal build deps with pinned versions
+# Build deps. python3-dev is intentionally omitted: the python:3.12 base
+# image already ships Python 3.12 headers; Bookworm's python3-dev would
+# install 3.11 headers, which is the wrong Python.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential=12.9 \
-        gcc=4:12.2 \
-        python3-dev=3.12.0 \
-        portaudio19-dev=19.7.0 \
-        libsndfile1=1.0.31 \
-        libgl1=1.7.0 \
-        libglib2.0-0=2.76.2 \
+        build-essential \
+        portaudio19-dev \
+        libsndfile1 \
+        libgl1 \
+        libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Isolated virtualenv with secure permissions
@@ -45,16 +45,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8000 \
     UMASK=0022
 
-# Minimal runtime deps with pinned versions
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg=7:7.0.1 \
-        libgl1=1.7.0 \
-        libglib2.0-0=2.76.2 \
-        libsndfile1=1.0.31 \
-        libportaudio2=19.7.0 \
-        tini=0.19.0 \
-        curl=8.7.1 \
-        ca-certificates=20231015 \
+        ffmpeg \
+        libgl1 \
+        libglib2.0-0 \
+        libsndfile1 \
+        libportaudio2 \
+        tini \
+        curl \
+        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user with minimal permissions
