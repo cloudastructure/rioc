@@ -62,15 +62,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN groupadd --system --gid 1000 rioc \
  && useradd --system --uid 1000 --gid rioc --home-dir ${APP_HOME} --shell /sbin/nologin rioc
 
-# Secure file permissions
 COPY --from=builder /opt/venv /opt/venv
-COPY --chown=rioc:rioc *.py .
-COPY --chown=rioc:rioc scripts/ ./scripts/
-COPY --chown=rioc:rioc mediamtx.yml .
 
 WORKDIR ${APP_HOME}
 
-# Secure data directory setup
+COPY --chown=rioc:rioc *.py ./
+COPY --chown=rioc:rioc scripts/ ./scripts/
+COPY --chown=rioc:rioc mediamtx.yml ./
+
 RUN mkdir -p ${DATA_DIR} ${APP_HOME}/audio_logs \
  && chown -R rioc:rioc ${DATA_DIR} ${APP_HOME} \
  && ln -sf ${DATA_DIR}/ai_guard.db ${APP_HOME}/ai_guard.db
