@@ -27,12 +27,14 @@ ENV PATH="/opt/venv/bin:${PATH}"
 
 WORKDIR /build
 
-# CPU-only PyTorch with pinned versions
+COPY requirements.txt .
+
+# The +cpu wheels are not on PyPI; they're published only on PyTorch's CPU index.
 RUN pip install --upgrade pip \
- && pip install \
+ && pip install --index-url https://download.pytorch.org/whl/cpu \
         "torch==2.4.1+cpu" \
         "torchvision==0.19.1+cpu" \
-    && pip install -r requirements.txt
+ && pip install -r requirements.txt
 
 # ---------- Stage 2: runtime ----------
 FROM python:3.12-slim-bookworm AS runtime
