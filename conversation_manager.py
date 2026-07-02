@@ -240,9 +240,9 @@ class ConversationManager:
         self.history = []
         self.turn_count = 0
         self._set_state(ConversationState.WARNING)
-        self._encounter = await self.backend.open_encounter()
 
         try:
+            self._encounter = await self.backend.open_encounter()
             if initial_text:
                 # The initial detection message was already spoken aloud by the Cloud AI.
                 # Log it as GUARD turn 1 and skip _do_turn so we don't speak a second

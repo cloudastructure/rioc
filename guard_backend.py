@@ -2,7 +2,8 @@
 
 Two implementations plug in behind this interface:
 - vllm_backend.VllmBackend — request/response, wraps minicpmo_client.chat().
-- realtime_backend.RealtimeBackend — websocket streaming (follow-up plan).
+- realtime_backend.RealtimeBackend — websocket streaming (planned; not yet implemented,
+  see docs/superpowers/plans/2026-07-02-swappable-guard-backend.md follow-up section).
 
 conversation_manager.ConversationManager depends on this interface only,
 so switching backends is an env var change (see backend_factory.py).
@@ -36,6 +37,10 @@ class GuardEncounter(Protocol):
 
         Returns (response_text, optional_wav_bytes). May return ("", None)
         if the model produced nothing usable.
+
+        ``history`` is read-only from the backend's perspective — the caller
+        may append to it after ``turn()`` returns, so any backend that needs
+        to retain the history across calls must make its own copy.
         """
         ...
 
