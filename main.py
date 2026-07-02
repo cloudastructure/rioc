@@ -1439,13 +1439,13 @@ async def lifespan(app: FastAPI):
     try:
         from conversation_manager import ConversationManager, set_manager
         from db import init_db as _init_db
-        from vllm_backend import VllmBackend
+        from backend_factory import get_backend
 
         async def _play_for_conv(wav_bytes: bytes, fmt: str = "wav") -> None:
             await _guarded_play(wav_bytes, fmt, force=True)
 
         _conv_manager = ConversationManager(
-            backend=VllmBackend(),
+            backend=get_backend(),
             play_audio_fn=_play_for_conv,
             get_frame_fn=lambda: _latest_conv_frame,
             speak_text_fn=lambda text: _speak_through_speaker(text, force=True),
