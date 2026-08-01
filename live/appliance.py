@@ -122,20 +122,96 @@ async def frame_uplink_pump(channel, frame_getter, fps: int = 2):
         await asyncio.sleep(interval)
 
 
-async def mic_barge_in_pump(detector, frames, channel, orchestrator):
-    """Edge VAD + barge-in + audio uplink.
+async def mic_barge_in_pump(detector, frames, channel, orchestrator, on_utterance=None):
+    """Edge VAD + barge-in + audio uplink, accumulating each person utterance for logging.
 
     frames: async generator yielding (pcm_bytes, rate, energy). The barge-in decision is
     BargeInDetector (unit-tested); guard-speaking state is read from the orchestrator each frame.
+    on_utterance(pcm_bytes, rate): optional async callback fired at each person speech_end,
+    used by the caller to run the (off-critical-path) Whisper transcript backfill.
     """
+    buffer = bytearray()
+    capturing = False
     async for pcm, rate, energy in frames:
         detector.set_guard_speaking(getattr(orchestrator, "_guard_speaking", False))
         event = detector.push(pcm, rate, energy)
-        if event == "speech_start":
-            await channel.send("user_speech_start")
+        if event in ("speech_start", "barge_in"):
+            orchestrator.note_person_spoke()
+            if event == "barge_in":
+                await orchestrator.barge_in()
+            else:
+                await channel.send("user_speech_start")
+            capturing = True
+            buffer = bytearray(pcm)
         elif event == "speech_end":
             await channel.send("user_speech_end")
-        elif event == "barge_in":
-            await orchestrator.barge_in()
+            if on_utterance is not None and buffer:
+                await on_utterance(bytes(buffer), rate)
+            capturing = False
+            buffer = bytearray()
+        elif capturing:
+            buffer.extend(pcm)
         # Uplink the person's audio for the model regardless of gate outcome.
         await channel.send("audio", pcm_or_opus_b64=base64.b64encode(pcm).decode())
+
+
+# ── continuous media sources (VERIFY ON HARDWARE) ────────────────────────────
+
+async def mic_frames(sample_rate: int = 16000, frame_ms: int = 30, device=None):
+    """Continuous mic capture for live barge-in. Yields (pcm_bytes, sample_rate, energy_rms).
+
+    VERIFY ON HARDWARE: needs sounddevice + a real input device. This is the continuous
+    counterpart to mic_listener.listen_for_response (which is one-shot half-duplex)."""
+    try:
+        import numpy as np
+        import sounddevice as sd
+    except ImportError:
+        return
+    frame_samples = int(sample_rate * frame_ms / 1000)
+    stream = sd.RawInputStream(
+        samplerate=sample_rate, blocksize=frame_samples, dtype="int16", channels=1, device=device,
+    )
+    stream.start()
+    try:
+        while True:
+            data, _ = await asyncio.to_thread(stream.read, frame_samples)
+            pcm = bytes(data)
+            arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+            energy = float(np.sqrt(np.mean(arr * arr))) if arr.size else 0.0
+            yield pcm, sample_rate, energy
+    finally:
+        stream.stop()
+        stream.close()
+
+
+async def rtsp_frame_source(rtsp_url: str, fps: int = 2, jpeg_quality: int = 70):
+    """Continuous JPEG frames from an RTSP camera, for true live video uplink to the model.
+
+    VERIFY ON HARDWARE: needs OpenCV + a reachable RTSP stream. This is what turns the
+    uplink from "one frozen detection frame" into an actual live feed."""
+    try:
+        import cv2
+    except ImportError:
+        return
+    cap = await asyncio.to_thread(cv2.VideoCapture, rtsp_url)
+    interval = 1.0 / max(fps, 1)
+    try:
+        while True:
+            ok, frame = await asyncio.to_thread(cap.read)
+            if not ok:
+                await asyncio.sleep(interval)
+                continue
+            ok2, buf = await asyncio.to_thread(
+                cv2.imencode, ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality],
+            )
+            if ok2:
+                yield buf.tobytes()
+            await asyncio.sleep(interval)
+    finally:
+        await asyncio.to_thread(cap.release)
+
+
+async def frame_source_uplink_pump(channel, frame_source):
+    """Stream JPEG frames from an async frame source up the live channel."""
+    async for jpeg in frame_source:
+        await channel.send("video", jpeg_b64=base64.b64encode(jpeg).decode())

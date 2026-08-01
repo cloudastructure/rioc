@@ -1902,11 +1902,18 @@ async def _begin_live_session(jpeg_bytes: bytes = b"", initial_text: str = "") -
     VERIFY ON HARDWARE: exercises the WS speaker + mic barge-in + omni streaming server;
     structurally complete but not yet run against real hardware / a live omni server."""
     global _live_orchestrator, _live_speaker, _live_tasks
+    from datetime import datetime, timezone
+    import db
+    import whisper_log
     from live.channel_client import ChannelClient
     from live.escalation import EscalationOverlay
     from live.live_session import LiveSessionOrchestrator
     from live.live_sse import broadcast_live
-    from live.appliance import WsSpeaker, downlink_pump, frame_uplink_pump
+    from live.barge_in import BargeInDetector
+    from live.appliance import (
+        WsSpeaker, downlink_pump, frame_uplink_pump, frame_source_uplink_pump,
+        rtsp_frame_source, mic_frames, mic_barge_in_pump,
+    )
 
     if _live_orchestrator is not None:
         return  # already active
@@ -1942,23 +1949,64 @@ async def _begin_live_session(jpeg_bytes: bytes = b"", initial_text: str = "") -
     channel = ChannelClient(clock=time.monotonic)
     await channel.connect(f"{alloc['gpu_ws_url']}?token={alloc['session_token']}")
 
-    # 3. Streaming speaker + escalation overlay + orchestrator.
+    # 3. Persistence callbacks (SQLite conversation log + async Whisper person-turn backfill).
+    def _now_iso():
+        return datetime.now(timezone.utc).isoformat()
+
+    async def _create(camera_id):
+        return await db.create_conversation(camera_id or None, _now_iso())
+
+    async def _save(cid, speaker_role, text):
+        await db.add_turn(cid, speaker_role, text, _now_iso())
+
+    async def _finish(cid, outcome):
+        await db.close_conversation(cid, _now_iso(), outcome)
+
+    await db.init_db()
+
+    # 4. Streaming speaker + escalation overlay + orchestrator (with persistence + clock).
     speaker = WsSpeaker(SPEAKER_WS_URL, SPEAKER_WS_SAMPLE_RATE)
     esc = EscalationOverlay(escalate_after=LIVE_ESCALATE_AFTER_SEC, final_after=LIVE_FINAL_AFTER_SEC)
-    orch = LiveSessionOrchestrator(channel, speaker, esc, on_event=broadcast_live)
+    orch = LiveSessionOrchestrator(
+        channel, speaker, esc, on_event=broadcast_live,
+        create_conv=_create, save_turn=_save, finish_conv=_finish, clock=time.monotonic,
+    )
     system_prompt = getattr(_conv_manager, "system_prompt", "") if _conv_manager is not None else ""
     if not await orch.start(system_prompt=system_prompt, voice=LIVE_VOICE, camera_id=CAMERA_ID):
         return  # capacity race — orch.start already broadcast 'capacity'
     _live_orchestrator = orch
     _live_speaker = speaker
 
-    # 4. Pumps. The mic barge-in loop (live.appliance.mic_barge_in_pump) is wired on-device
-    #    from the mic source; frame uplink + downlink + speaker run here.
+    # 5. Person-turn Whisper backfill (off critical path), fired at each person speech_end.
+    async def _on_person_utterance(pcm_bytes, rate):
+        try:
+            from mic_listener import _bytes_to_wav
+            wav = _bytes_to_wav(pcm_bytes, rate)
+        except Exception:
+            wav = pcm_bytes
+        cid = orch.conversation_id
+        if cid is not None:
+            asyncio.create_task(whisper_log.backfill_person_turn(_transcribe_audio, wav, cid, db))
+
+    # 6. Pumps. VERIFY ON HARDWARE: mic + RTSP sources need real devices.
+    import webrtcvad
+    detector = BargeInDetector(webrtcvad.Vad(2), echo_floor=float(os.environ.get("LIVE_ECHO_FLOOR", "300")))
     _live_tasks = [
         asyncio.create_task(speaker.run()),
         asyncio.create_task(downlink_pump(orch, channel)),
-        asyncio.create_task(frame_uplink_pump(channel, lambda: _latest_conv_frame, fps=2)),
+        asyncio.create_task(orch.run_escalation(1.0)),
+        asyncio.create_task(mic_barge_in_pump(detector, mic_frames(), channel, orch, on_utterance=_on_person_utterance)),
     ]
+    # Live video: continuous RTSP feed if the camera is reachable from Rioc; otherwise fall
+    # back to the single (stale) detection frame and warn — the model can't truly "watch" then.
+    if CAMERA_RTSP_URL:
+        _live_tasks.append(asyncio.create_task(
+            frame_source_uplink_pump(channel, rtsp_frame_source(CAMERA_RTSP_URL, fps=2))))
+    else:
+        broadcast_live({"type": "warning", "code": "no_live_video",
+                        "message": "No CAMERA_RTSP_URL — model sees only the single detection frame, not a live feed"})
+        _live_tasks.append(asyncio.create_task(
+            frame_uplink_pump(channel, lambda: _latest_conv_frame, fps=2)))
 
 
 async def _end_live_session(reason: str = "operator_stop") -> None:
