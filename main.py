@@ -167,6 +167,19 @@ latest_analysis: str = ""  # Latest Cloud AI vision output (non-CLEAR)
 # camera is configured.
 _latest_conv_frame: bytes | None = None
 
+# ── Live (full-duplex) mode ──────────────────────────────────────────────────
+from live.routing import route_conversation, validate_live_config  # noqa: E402
+
+CONVERSATION_MODE = os.environ.get("CONVERSATION_MODE", "turn_based").strip().lower()
+OMNI_ROUTER_URL = (os.environ.get("OMNI_ROUTER_URL") or "").rstrip("/")
+LIVE_VOICE = os.environ.get("LIVE_VOICE", "default")
+LIVE_ESCALATE_AFTER_SEC = float(os.environ.get("LIVE_ESCALATE_AFTER_SEC", "20"))
+LIVE_FINAL_AFTER_SEC = float(os.environ.get("LIVE_FINAL_AFTER_SEC", "45"))
+CAMERA_ID = os.environ.get("CAMERA_ID", "")
+_live_orchestrator = None
+_live_speaker = None
+_live_tasks: list = []
+
 
 # TTS rate-limiting: one announcement at a time with a cooldown between them.
 # _tts_active is set True before the first await, so asyncio's single-threaded model
@@ -1288,9 +1301,16 @@ async def cloud_audit_loop() -> None:
                         _log_event("ai_alert", msg)
                         # Speak via OpenAI TTS (fast) and start conversation manager in parallel
                         asyncio.create_task(_speak_through_speaker(msg))
-                        if _conv_manager is not None and not _conv_manager.is_active():
+                        def _live():
                             _presence_lock.on_conversation_started()
-                            asyncio.create_task(_conv_manager.on_person_detected(jpeg_bytes, initial_text=msg))
+                            asyncio.create_task(_begin_live_session(jpeg_bytes, initial_text=msg))
+
+                        def _turn_based():
+                            if _conv_manager is not None and not _conv_manager.is_active():
+                                _presence_lock.on_conversation_started()
+                                asyncio.create_task(_conv_manager.on_person_detected(jpeg_bytes, initial_text=msg))
+
+                        route_conversation(CONVERSATION_MODE, _live, _turn_based)
         except Exception as e:
             print(f"[Cloud AI] Request failed: {e}", flush=True)
 
@@ -1873,6 +1893,127 @@ async def conversation_stream():
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
+# ── Live (full-duplex) mode endpoints ────────────────────────────────────────
+
+async def _begin_live_session(jpeg_bytes: bytes = b"", initial_text: str = "") -> None:
+    """Start a full-duplex live conversation: allocate a GPU, open the live channel,
+    wire the streaming speaker + escalation + orchestrator, and spawn the pumps.
+
+    VERIFY ON HARDWARE: exercises the WS speaker + mic barge-in + omni streaming server;
+    structurally complete but not yet run against real hardware / a live omni server."""
+    global _live_orchestrator, _live_speaker, _live_tasks
+    from live.channel_client import ChannelClient
+    from live.escalation import EscalationOverlay
+    from live.live_session import LiveSessionOrchestrator
+    from live.live_sse import broadcast_live
+    from live.appliance import WsSpeaker, downlink_pump, frame_uplink_pump
+
+    if _live_orchestrator is not None:
+        return  # already active
+
+    # Barge-in requires a WebSocket-capable speaker.
+    try:
+        validate_live_config("live", SPEAKER_TYPE)
+    except ValueError as e:
+        broadcast_live({"type": "error", "code": "speaker", "message": str(e)})
+        return
+    if not OMNI_ROUTER_URL:
+        broadcast_live({"type": "error", "code": "config", "message": "OMNI_ROUTER_URL not set"})
+        return
+
+    # 1. Allocate a GPU from the Session Router (control-plane only).
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{OMNI_ROUTER_URL}/allocate", json={"camera_id": CAMERA_ID}, timeout=10.0,
+            )
+    except Exception as e:
+        broadcast_live({"type": "error", "code": "router", "message": str(e)})
+        return
+    if r.status_code == 409:
+        broadcast_live({"type": "capacity"})
+        return
+    if r.status_code >= 400:
+        broadcast_live({"type": "error", "code": "router", "message": f"allocate {r.status_code}"})
+        return
+    alloc = r.json()  # {gpu_ws_url, session_token, lease_ttl}
+
+    # 2. Connect the live channel straight to the chosen GPU (media never proxies via the router).
+    channel = ChannelClient(clock=time.monotonic)
+    await channel.connect(f"{alloc['gpu_ws_url']}?token={alloc['session_token']}")
+
+    # 3. Streaming speaker + escalation overlay + orchestrator.
+    speaker = WsSpeaker(SPEAKER_WS_URL, SPEAKER_WS_SAMPLE_RATE)
+    esc = EscalationOverlay(escalate_after=LIVE_ESCALATE_AFTER_SEC, final_after=LIVE_FINAL_AFTER_SEC)
+    orch = LiveSessionOrchestrator(channel, speaker, esc, on_event=broadcast_live)
+    system_prompt = getattr(_conv_manager, "system_prompt", "") if _conv_manager is not None else ""
+    if not await orch.start(system_prompt=system_prompt, voice=LIVE_VOICE, camera_id=CAMERA_ID):
+        return  # capacity race — orch.start already broadcast 'capacity'
+    _live_orchestrator = orch
+    _live_speaker = speaker
+
+    # 4. Pumps. The mic barge-in loop (live.appliance.mic_barge_in_pump) is wired on-device
+    #    from the mic source; frame uplink + downlink + speaker run here.
+    _live_tasks = [
+        asyncio.create_task(speaker.run()),
+        asyncio.create_task(downlink_pump(orch, channel)),
+        asyncio.create_task(frame_uplink_pump(channel, lambda: _latest_conv_frame, fps=2)),
+    ]
+
+
+async def _end_live_session(reason: str = "operator_stop") -> None:
+    global _live_orchestrator, _live_speaker, _live_tasks
+    if _live_orchestrator is not None:
+        try:
+            await _live_orchestrator.end(reason)
+        except Exception:
+            pass
+    if _live_speaker is not None:
+        _live_speaker.close()
+    for t in _live_tasks:
+        t.cancel()
+    _live_orchestrator = None
+    _live_speaker = None
+    _live_tasks = []
+
+
+@app.post("/live/start")
+async def live_start():
+    if _live_orchestrator is not None:
+        return {"ok": False, "reason": "already active"}
+    asyncio.create_task(_begin_live_session(_latest_conv_frame or b""))
+    return {"ok": True}
+
+
+@app.post("/live/stop")
+async def live_stop():
+    await _end_live_session("operator_stop")
+    return {"ok": True}
+
+
+@app.get("/live/stream")
+async def live_stream():
+    """SSE stream of live-mode events (state, turn, caption, barge_in, capacity, error, ended)."""
+    from live.live_sse import register_live_listener, unregister_live_listener
+
+    q = register_live_listener()
+
+    async def event_generator():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=30.0)
+                    yield f"data: {json.dumps(event)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            unregister_live_listener(q)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
 @app.get("/conversations")
 async def list_conversations(limit: int = 50, offset: int = 0):
     """Return paginated conversation history."""
@@ -2013,6 +2154,13 @@ async def _handle_person_detected_event(body: PersonDetectedEvent) -> None:
         pass
     await asyncio.sleep(0.5)
     await _speak_through_speaker(msg)
-    if _conv_manager is not None and not _conv_manager.is_active():
+    def _live():
         _presence_lock.on_conversation_started()
-        asyncio.create_task(_conv_manager.on_person_detected(jpeg_bytes or b"", initial_text=msg))
+        asyncio.create_task(_begin_live_session(jpeg_bytes or b"", initial_text=msg))
+
+    def _turn_based():
+        if _conv_manager is not None and not _conv_manager.is_active():
+            _presence_lock.on_conversation_started()
+            asyncio.create_task(_conv_manager.on_person_detected(jpeg_bytes or b"", initial_text=msg))
+
+    route_conversation(CONVERSATION_MODE, _live, _turn_based)
