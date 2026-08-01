@@ -72,6 +72,26 @@ async def add_turn(
         return cursor.lastrowid
 
 
+async def append_live_turn(
+    conversation_id: int,
+    speaker: str,
+    text: str,
+    audio_path: str | None = None,
+) -> None:
+    """Append a turn to a live conversation's log (used by the async Whisper backfill).
+
+    Unlike add_turn, does not bump turn_count — the live turn count is driven by the
+    live-channel turn events, and the Whisper backfill runs off the critical path.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO conversation_turns (conversation_id, speaker, text, audio_path, timestamp)
+               VALUES (?, ?, ?, ?, datetime('now'))""",
+            (conversation_id, speaker, text, audio_path),
+        )
+        await db.commit()
+
+
 async def close_conversation(conversation_id: int, ended_at: str, outcome: str) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
