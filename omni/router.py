@@ -28,20 +28,36 @@ class Router:
         self._token_factory = token_factory or (lambda: f"tok-{next(self._ids)}")
         self._leases = {}
 
-    def allocate(self, camera_id):
+    def allocate(self, camera_id, now=0.0):
         candidates = [g for g in self._gpus if g.healthy and g.in_use < g.capacity]
         if not candidates:
             return None
         gpu = min(candidates, key=lambda g: g.in_use)  # least-loaded (ties -> first)
         gpu.in_use += 1
         token = self._token_factory()
-        self._leases[token] = gpu
+        self._leases[token] = (gpu, now + self.lease_ttl)
         return {"gpu_ws_url": gpu.ws_url, "session_token": token, "lease_ttl": self.lease_ttl}
 
     def release(self, session_token):
-        gpu = self._leases.pop(session_token, None)
-        if gpu and gpu.in_use > 0:
-            gpu.in_use -= 1
+        entry = self._leases.pop(session_token, None)
+        if entry:
+            gpu, _expires = entry
+            if gpu.in_use > 0:
+                gpu.in_use -= 1
+
+    def touch(self, session_token, now):
+        """Renew a lease (call on heartbeat / omni-server occupancy report)."""
+        entry = self._leases.get(session_token)
+        if entry:
+            gpu, _expires = entry
+            self._leases[session_token] = (gpu, now + self.lease_ttl)
+
+    def reap(self, now):
+        """Release any lease whose expiry has passed (reclaims slots leaked by a crashed session)."""
+        expired = [t for t, (_gpu, exp) in self._leases.items() if exp <= now]
+        for t in expired:
+            self.release(t)
+        return len(expired)
 
     def set_health(self, ws_url, healthy):
         for g in self._gpus:

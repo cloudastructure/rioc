@@ -2062,6 +2062,21 @@ async def live_stream():
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
+@app.post("/api/frame-update", status_code=204)
+async def frame_update(body: dict):
+    """Continuous fresh frames pushed by the edge/CVR — the live-video source for deployments
+    where Rioc cannot pull the camera RTSP directly. Keeps _latest_conv_frame live so the
+    frame uplink streams a real feed rather than one frozen detection frame."""
+    global _latest_conv_frame
+    frame = body.get("frame")
+    if frame:
+        try:
+            _latest_conv_frame = base64.b64decode(frame)
+        except Exception:
+            pass
+    return Response(status_code=204)
+
+
 @app.get("/conversations")
 async def list_conversations(limit: int = 50, offset: int = 0):
     """Return paginated conversation history."""

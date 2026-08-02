@@ -37,3 +37,20 @@ def test_unhealthy_gpu_excluded():
 def test_fleet_capacity_sums_per_gpu():
     r = Router([GpuRef("wss://g1", 2), GpuRef("wss://g2", 3)])
     assert r.fleet_capacity == 5
+
+
+def test_reap_releases_expired_leases():
+    r = Router([GpuRef("wss://g1", 2)], lease_ttl=10.0, token_factory=lambda: "tok")
+    r.allocate("c", now=0.0)          # lease expires at 10
+    assert r.fleet_in_use == 1
+    assert r.reap(now=5.0) == 0       # not expired yet
+    assert r.reap(now=15.0) == 1      # expired -> reclaimed
+    assert r.fleet_in_use == 0
+
+
+def test_touch_extends_lease():
+    r = Router([GpuRef("wss://g1", 1)], lease_ttl=10.0)
+    tok = r.allocate("c", now=0.0)["session_token"]
+    r.touch(tok, now=8.0)             # lease now expires at 18
+    assert r.reap(now=12.0) == 0
+    assert r.fleet_in_use == 1
