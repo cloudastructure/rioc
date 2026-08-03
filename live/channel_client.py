@@ -17,7 +17,13 @@ class ChannelClient:
         self._seq = itertools.count()
 
     async def connect(self, url):
-        self._ws = await websockets.connect(url, max_size=None)
+        ssl_ctx = None
+        if url.startswith("wss"):
+            import ssl
+            ssl_ctx = ssl.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE  # LAN/self-signed omni server
+        self._ws = await websockets.connect(url, max_size=None, ssl=ssl_ctx)
 
     async def send(self, type, **payload):
         await self._ws.send(p.encode(p.make(type, next(self._seq), self._clock(), **payload)))

@@ -21,9 +21,16 @@ def _msg(mtype, seq, **payload):
     return json.dumps({"type": mtype, "seq": seq, "ts": time.monotonic(), **payload})
 
 
-async def _one_session(url, frames=3):
+async def _one_session(url, frames=3, insecure=False):
+    import ssl
     import websockets
-    async with websockets.connect(url, max_size=None) as ws:
+    ssl_ctx = None
+    if url.startswith("wss"):
+        ssl_ctx = ssl.create_default_context()
+        if insecure:
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+    async with websockets.connect(url, max_size=None, ssl=ssl_ctx) as ws:
         await ws.send(_msg("session_start", 0, system_prompt="benchmark", voice="default"))
         ready = json.loads(await ws.recv())
         if ready.get("type") != "session_ready":
@@ -42,8 +49,8 @@ async def _one_session(url, frames=3):
                 return None
 
 
-async def _level(url, n):
-    results = await asyncio.gather(*[_one_session(url) for _ in range(n)], return_exceptions=True)
+async def _level(url, n, insecure=False):
+    results = await asyncio.gather(*[_one_session(url, insecure=insecure) for _ in range(n)], return_exceptions=True)
     latencies = [r for r in results if isinstance(r, float)]
     rejected = sum(1 for r in results if r is None)
     return latencies, rejected
@@ -54,11 +61,12 @@ async def main():
     ap.add_argument("--url", required=True, help="ws://host:port/omni/session")
     ap.add_argument("--levels", default="1,2,4,8")
     ap.add_argument("--budget-ms", type=float, default=1000.0, help="real-time first-speech budget")
+    ap.add_argument("--insecure", action="store_true", help="skip TLS verification (self-signed wss)")
     args = ap.parse_args()
 
     print(f"{'N':>4}  {'ok':>4}  {'rej':>4}  {'p50_ms':>8}  {'p95_ms':>8}  verdict")
     for n in [int(x) for x in args.levels.split(",")]:
-        latencies, rejected = await _level(args.url, n)
+        latencies, rejected = await _level(args.url, n, insecure=args.insecure)
         if not latencies:
             print(f"{n:>4}  {0:>4}  {rejected:>4}  {'-':>8}  {'-':>8}  all rejected/failed")
             continue
