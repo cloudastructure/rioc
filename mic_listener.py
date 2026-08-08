@@ -10,6 +10,8 @@ has finished playing before calling listen_for_response().
 import io
 import logging
 import os
+import threading
+import time
 import wave
 
 import numpy as np
@@ -23,11 +25,18 @@ VAD_SAMPLE_RATE = int(os.environ.get("VAD_SAMPLE_RATE", "16000"))
 # Frame duration in ms — webrtcvad supports 10, 20, 30 ms
 VAD_FRAME_MS = int(os.environ.get("VAD_FRAME_MS", "30"))
 # Max silence after speech detected before we consider the utterance done
-VAD_SILENCE_FRAMES = int(os.environ.get("VAD_SILENCE_FRAMES", "20"))  # ~600ms at 30ms
+# 33 frames × 30ms ≈ 1000ms — natural conversational pause before capturing
+VAD_SILENCE_FRAMES = int(os.environ.get("VAD_SILENCE_FRAMES", "33"))
 # Max total duration to listen for (seconds) before giving up
-VAD_MAX_LISTEN_SEC = float(os.environ.get("VAD_MAX_LISTEN_SEC", "8.0"))
+# 20s gives the person adequate time to think and form a response
+VAD_MAX_LISTEN_SEC = float(os.environ.get("VAD_MAX_LISTEN_SEC", "20.0"))
 # Minimum speech frames to count as a real utterance (filters noise bursts)
 VAD_MIN_SPEECH_FRAMES = int(os.environ.get("VAD_MIN_SPEECH_FRAMES", "5"))
+# Seconds to wait after speaker finishes before opening the mic.
+# For the WebSocket path the send loop is already real-time paced so the
+# only remaining delay is the speaker's hardware jitter buffer (~100–200ms).
+# 0.5s is sufficient; increase if echo is still picked up.
+SPEAKING_BUFFER_SEC = float(os.environ.get("SPEAKING_BUFFER_SEC", "0.5"))
 
 AUDIO_INPUT_DEVICE = (os.environ.get("AUDIO_INPUT_DEVICE") or "").strip() or None
 
@@ -62,13 +71,26 @@ def _bytes_to_wav(pcm_bytes: bytes, sample_rate: int, channels: int = 1) -> byte
     return buf.getvalue()
 
 
-def listen_for_response(device_hint: str | None = None) -> bytes | None:
+def listen_for_response(
+    device_hint: str | None = None,
+    speaking_event: threading.Event | None = None,
+) -> bytes | None:
     """Block and listen for a spoken response.  Returns WAV bytes or None.
 
     This is a synchronous function intended to be called in a thread via
     asyncio.to_thread().  It records audio in VAD-gated chunks and returns
     as soon as the speaker stops talking or the max duration elapses.
+
+    speaking_event: if set, the function waits for the event to clear (TTS
+    playback done) and then sleeps SPEAKING_BUFFER_SEC before opening the mic,
+    preventing speaker echo from being captured as a person's response.
     """
+    if speaking_event is not None and speaking_event.is_set():
+        logger.debug("[mic_listener] Waiting for speaker to finish...")
+        speaking_event.wait()
+        time.sleep(SPEAKING_BUFFER_SEC)
+        logger.debug("[mic_listener] Speaker buffer elapsed — opening mic")
+
     try:
         import webrtcvad
         import sounddevice as sd

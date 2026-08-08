@@ -120,7 +120,7 @@ Do not describe. Do not use passive detection language. Speak to the person."""
 # Optional audio transcription (cloud STT)
 ENABLE_AUDIO_STT = os.environ.get("ENABLE_AUDIO_STT", "").strip().lower() in ("1", "true", "yes")
 OPENAI_STT_API_KEY = os.environ.get("OPENAI_STT_API_KEY") or os.environ.get("OPENAI_API_KEY")
-OPENAI_STT_MODEL = os.environ.get("OPENAI_STT_MODEL", "whisper-1")
+OPENAI_STT_MODEL = os.environ.get("OPENAI_STT_MODEL", "gpt-4o-transcribe")
 STT_SAMPLE_RATE = int(os.environ.get("STT_SAMPLE_RATE", "16000"))
 STT_DURATION_SEC = float(os.environ.get("STT_DURATION_SEC", "5.0"))
 STT_GAP_SEC = float(os.environ.get("STT_GAP_SEC", "0.0"))
@@ -166,6 +166,16 @@ latest_analysis: str = ""  # Latest Cloud AI vision output (non-CLEAR)
 # conversation turns always see the freshest frame regardless of whether a live
 # camera is configured.
 _latest_conv_frame: bytes | None = None
+_latest_conv_frame_ts: float = 0.0  # time.time() when _latest_conv_frame was last set
+
+
+def _get_conv_frame() -> bytes | None:
+    """Return _latest_conv_frame for conversation turns, logging its age."""
+    frame = _latest_conv_frame
+    if frame is not None and _latest_conv_frame_ts:
+        age_ms = int((time.time() - _latest_conv_frame_ts) * 1000)
+        logger.info("[ConvFrame] using frame captured %dms ago", age_ms)
+    return frame
 
 
 # TTS rate-limiting: one announcement at a time with a cooldown between them.
@@ -869,8 +879,9 @@ async def _transcribe_audio(wav_bytes: bytes) -> str | None:
             )
             return (result.text or "").strip()
 
+        _t0 = time.monotonic()
         text = await asyncio.to_thread(_do)
-        logger.info("[Transcribe] Raw Whisper result: %r", text)
+        logger.info("[Transcribe] took %.1fs — raw result: %r", time.monotonic() - _t0, text)
         if not text:
             logger.warning("[Transcribe] Empty transcript returned")
             return None
@@ -1445,7 +1456,7 @@ async def lifespan(app: FastAPI):
 
         _conv_manager = ConversationManager(
             play_audio_fn=_play_for_conv,
-            get_frame_fn=lambda: _latest_conv_frame,
+            get_frame_fn=_get_conv_frame,
             speak_text_fn=lambda text: _speak_through_speaker(text, force=True),
             transcribe_fn=_transcribe_audio,
         )
@@ -1793,6 +1804,26 @@ class PersonDetectedEvent(BaseModel):
     frame: str | None = None  # Base64-encoded JPEG; absent if CVR encoding failed
 
 
+class FrameUpdateEvent(BaseModel):
+    stream_id: str
+    timestamp: int  # Unix epoch milliseconds
+    frame: str  # Base64-encoded JPEG
+
+
+@app.post("/api/frame-update", status_code=204)
+async def frame_update_webhook(body: FrameUpdateEvent):
+    """Receive a streaming frame update from the yolo-detector while a person is present.
+    Updates _latest_conv_frame so conversation turns use a recent CVR frame.
+    Does not trigger any conversation or alert logic."""
+    global _latest_conv_frame, _latest_conv_frame_ts
+    try:
+        _latest_conv_frame = base64.b64decode(body.frame)
+        _latest_conv_frame_ts = time.time()
+        logger.info("[FrameUpdate] stream=%s frame_ts=%d", body.stream_id, body.timestamp)
+    except Exception:
+        pass
+
+
 class ConversationRespondRequest(BaseModel):
     audioBase64: str  # WAV bytes, base64-encoded
 
@@ -1938,12 +1969,13 @@ async def _handle_person_detected_event(body: PersonDetectedEvent) -> None:
     # Log the raw detection so the yellow YOLO badge appears in the AlertsLog timeline.
     _log_event("yolo_detected", f"stream={body.stream_id}")
 
-    global _latest_conv_frame
+    global _latest_conv_frame, _latest_conv_frame_ts
     jpeg_bytes: bytes | None = None
     if body.frame:
         try:
             jpeg_bytes = base64.b64decode(body.frame)
             _latest_conv_frame = jpeg_bytes  # keep cache fresh for conversation turns
+            _latest_conv_frame_ts = time.time()
         except Exception as e:
             print(f"[RiocHook] Failed to decode frame: {e}", flush=True)
 
