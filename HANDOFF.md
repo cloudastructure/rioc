@@ -44,6 +44,10 @@ The FastAPI app lives in **`main.py`** (run with uvicorn). The old `webcam_strea
 - `docs/superpowers/plans/2026-08-01-live-multimodal-guard-backend.md` — the Live backend implementation plan.
 - `docs/superpowers/plans/2026-07-02-swappable-guard-backend.md` — swappable backend plan.
 
+On **this** (`feat/live-multimodal-guard`) branch:
+- `docs/OMNI_STREAMING_SERVER.md` — how to stand up the MiniCPM-o streaming server (your first task, §4).
+- `docs/superpowers/specs/2026-08-01-live-main-integration.md` — Live/`main.py` integration spec.
+
 ---
 
 ## 4. The one real blocker for Live mode
@@ -52,6 +56,7 @@ The full-duplex Live pipeline is built on the Rioc side (`omni/` + `live/`, ~40 
 
 - MiniCPM-o is currently served by plain **`vllm serve`** — stateless `/v1/chat/completions` only. vLLM **cannot hold a streaming omni session**, so true full-duplex barge-in doesn't work against it.
 - **What's needed:** stand up `omni/server.py` (HF MiniCPM-o `streaming_prefill` / `generate`) on the GPU box, and confirm the downlink audio rate/encoding (`MINICPMO_AUDIO_RATE`). That spike is the gate; the Rioc side is otherwise complete.
+- **Step-by-step for this is in [`docs/OMNI_STREAMING_SERVER.md`](./docs/OMNI_STREAMING_SERVER.md) on this branch** — start there.
 
 Everything else (Session Router, admission, barge-in, escalation timer, SQLite persistence, live SSE) is implemented and unit-tested — it just needs a real streaming server + a hardware run.
 
