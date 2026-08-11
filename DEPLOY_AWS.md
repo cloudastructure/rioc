@@ -272,3 +272,31 @@ The endpoint starts but chat completions return 500. The error is generic; the *
 2. **Model name** – Cloud Brain now auto-discovers the model from `/v1/models`. If RunPod uses `OPENAI_SERVED_MODEL_NAME_OVERRIDE`, the discovered name will be used automatically.
 
 3. **Image size** – If logs show OOM during inference, reduce frame size on the Mac: in `webcam_stream.py`, lower `FRAME_SIZE` (e.g. `(384, 384)`) and/or `JPEG_QUALITY`.
+
+---
+
+## Backend Selection (GUARD_BACKEND)
+
+The guard's model calls go through a `GuardBackend` interface so we can swap
+between request/response and streaming servers without changing conversation
+code.
+
+| Value | Serving process | Transport | Status |
+|-------|-----------------|-----------|--------|
+| `vllm` (default) | vLLM's OpenAI-compatible HTTP server | HTTP `/v1/chat/completions` | Ready. |
+| `realtime` | OpenBMB's MiniCPM-o realtime server | WebSocket | Not implemented — see follow-up plan; requires the realtime server to be running on the MiniCPM-o host. |
+
+Set on the Mac side (or wherever `main.py` runs):
+
+```bash
+export GUARD_BACKEND=vllm   # default
+```
+
+`vllm` uses `MINICPMO_URL` / `CLOUD_AI_URL` as today. `realtime` will use a
+separate `MINICPMO_REALTIME_URL` (websocket) once that backend lands.
+
+Tunable while on `vllm`:
+
+- `VLLM_FRAME_BUFFER_SIZE` (default `1`) — how many recent frames the
+  backend buffers per encounter. Currently only the newest frame is sent per
+  turn; larger buffers are reserved for a future frame-burst experiment.

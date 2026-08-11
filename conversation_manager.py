@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Awaitable
 
 from db import init_db, create_conversation, add_turn, close_conversation
-from minicpmo_client import chat as minicpmo_chat
+from guard_backend import GuardBackend, GuardEncounter
 from mic_listener import listen_for_response
 
 logger = logging.getLogger(__name__)
@@ -142,6 +142,8 @@ def _broadcast(event: dict) -> None:
 class ConversationManager:
     def __init__(
         self,
+        *,
+        backend: GuardBackend,
         play_audio_fn: Callable[[bytes, str], Awaitable[None]],
         get_frame_fn: Callable[[], bytes | None],
         camera_id: str | None = None,
@@ -151,11 +153,13 @@ class ConversationManager:
         transcribe_fn: Callable[[bytes], Awaitable[str | None]] | None = None,
     ):
         """
+        backend:        GuardBackend instance (opens GuardEncounter per conversation)
         play_audio_fn:  async (wav_bytes, format) → None  (calls _guarded_play with force=True)
         get_frame_fn:   sync  () → jpeg_bytes | None      (called in thread)
         speak_text_fn:  async (text) → None               (OpenAI TTS fallback when VLM returns no audio)
         transcribe_fn:  async (wav_bytes) → str | None    (OpenAI Whisper transcription of person's audio)
         """
+        self.backend = backend
         self.play_audio_fn = play_audio_fn
         self.get_frame_fn = get_frame_fn
         self.speak_text_fn = speak_text_fn
@@ -174,6 +178,7 @@ class ConversationManager:
         self._last_ended: float = 0.0
         self._speaking_event = threading.Event()  # set while TTS audio is playing
         self._audio_task: asyncio.Task | None = None  # background audio dispatch task
+        self._encounter: GuardEncounter | None = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -237,6 +242,7 @@ class ConversationManager:
         self._set_state(ConversationState.WARNING)
 
         try:
+            self._encounter = await self.backend.open_encounter()
             if initial_text:
                 # The initial detection message was already spoken aloud by the Cloud AI.
                 # Log it as GUARD turn 1 and skip _do_turn so we don't speak a second
@@ -269,10 +275,12 @@ class ConversationManager:
         """Send frame (+ optional prior context) to MiniCPM-o, play response."""
         self._set_state(ConversationState.SPEAKING)
         try:
-            text, wav_bytes = await minicpmo_chat(
-                jpeg_bytes=jpeg_bytes,
+            assert self._encounter is not None, "_do_turn called before _run_conversation opened an encounter"
+            await self._encounter.push_frame(jpeg_bytes)
+            text, wav_bytes = await self._encounter.turn(
+                audio_bytes=None,
                 system_prompt=self.system_prompt,
-                conversation_history=self.history,
+                history=self.history,
                 user_text=_TURN_ROLE_REMINDER,
             )
         except Exception as exc:
@@ -420,6 +428,12 @@ class ConversationManager:
             except asyncio.CancelledError:
                 pass
         self._speaking_event.clear()
+        if self._encounter is not None:
+            try:
+                await self._encounter.close()
+            except Exception as exc:
+                logger.warning("[ConvMgr] encounter.close() failed: %s", exc)
+            self._encounter = None
         ended_at = _now()
         state = self.state
 
