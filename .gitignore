@@ -33,3 +33,11 @@ Thumbs.db
 
 # YOLO model weights (auto-downloaded at runtime)
 *.pt
+
+# Runtime artifacts (not source)
+ai_guard.db
+*.db
+audio_logs/
+
+# Agent tooling
+.claude/

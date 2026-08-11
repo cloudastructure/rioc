@@ -1,0 +1,175 @@
+<title>Live Multimodal Guard — Explainer</title>
+<style>
+  :root{
+    --ink:#282d37;--body:#4b5563;--dim:#6b7280;--faint:#9aa2b1;--line:#e2e5ea;
+    --blue:#2563eb;--red:#dc2626;--green:#16a34a;--amber:#d97706;--purple:#7c3aed;--cyan:#0891b2;--slate:#475569;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:#eceef2;color:var(--ink);font-family:var(--sans);
+    background-image:linear-gradient(rgba(20,24,34,.035) 1px,transparent 1px),
+      linear-gradient(90deg,rgba(20,24,34,.035) 1px,transparent 1px);
+    background-size:28px 28px;padding:34px 20px}
+  .sheet{max-width:940px;margin:0 auto 26px;background:#fff;border-radius:18px;
+    box-shadow:0 6px 30px rgba(20,24,34,.08);padding:34px 40px}
+  .vtitle{text-align:center;font-size:29px;font-weight:600;margin:0 0 4px}
+  .vsub{text-align:center;color:var(--dim);font-size:14px;margin:0 0 26px}
+  .lab{text-align:center;font-size:11px;text-transform:uppercase;letter-spacing:.14em;color:var(--faint);margin:22px 0 12px}
+  .arrow{text-align:center;color:#b7bdc9;font-size:20px;margin:6px 0}
+  .arrow small{display:block;font-size:11px;color:var(--faint);letter-spacing:.03em}
+  .card{border-radius:12px;border:2px solid var(--slate);background:#fff;box-shadow:0 1px 3px rgba(20,24,34,.05);padding:14px 16px}
+  .card h4{margin:0 0 5px;font-size:15px;color:var(--slate)}
+  .card p{margin:0;font-size:13px;color:var(--body);line-height:1.5}
+  .row{display:flex;gap:14px;flex-wrap:wrap}.row>*{flex:1;min-width:170px}
+  .outer{border:1.5px solid var(--line);background:#fafbfc;border-radius:14px;padding:16px}
+  .outer.plat{border-color:#c7d6f5;background:#f6f9ff}
+  .blue{border-color:var(--blue)}.blue h4{color:var(--blue)}
+  .red{border-color:var(--red)}.red h4{color:var(--red)}
+  .green{border-color:var(--green)}.green h4{color:var(--green)}
+  .amber{border-color:var(--amber)}.amber h4{color:var(--amber)}
+  .purple{border-color:var(--purple)}.purple h4{color:var(--purple)}
+  .cyan{border-color:var(--cyan)}.cyan h4{color:var(--cyan)}
+  .slate{border-color:var(--slate)}.slate h4{color:var(--slate)}
+  .chip{display:inline-block;border:1px dashed #c3c9d4;border-radius:20px;padding:3px 11px;font-size:12px;color:var(--dim);margin:3px 4px}
+  .sig{font-family:var(--mono);font-size:12px;background:#f3f4f7;border-radius:6px;padding:7px 10px;color:var(--ink);display:inline-block;margin-top:6px}
+  .step{display:flex;gap:14px;align-items:flex-start;margin:0 auto;max-width:620px}
+  .badge{width:30px;height:30px;border-radius:50%;color:#fff;font-weight:700;display:flex;align-items:center;justify-content:center;flex:none;font-size:14px;margin-top:2px}
+  .step .card{flex:1}
+  .rp{font-size:12.5px;color:var(--body);line-height:1.55;margin-top:6px}
+  .rp b{color:var(--ink)}
+  .gate{background:#fdf6ec;border-radius:8px;padding:6px 10px;color:var(--amber);font-size:12px;margin-top:7px}
+  .pay{font-family:var(--mono);font-size:11.5px;background:#f3f4f7;border-radius:5px;padding:2px 6px}
+  .dark{background:#20242e;color:#fff;border-radius:14px;padding:20px 24px;text-align:center;max-width:620px;margin:16px auto 0}
+  .dark .big{font-size:30px;font-weight:700}
+  .dark .cap{color:#aeb6c4;font-size:13px;margin-top:4px}
+  .loop{display:flex;align-items:center;justify-content:center;gap:0;flex-wrap:wrap}
+  .loop .card{min-width:130px;max-width:180px}
+  .loop .j{color:#b7bdc9;font-size:20px;padding:0 10px}
+  .bar{text-align:center;font-size:17px;line-height:1.5;color:var(--ink);max-width:660px;margin:0 auto 22px;font-weight:500}
+</style>
+
+<!-- 1 · SYSTEM ARCHITECTURE -->
+<div class="sheet">
+  <h2 class="vtitle">What it is</h2>
+  <p class="vsub">A security guard that watches and talks — powered by one AI that sees and hears at the same time</p>
+
+  <div class="lab">What the operator touches</div>
+  <div class="outer purple" style="text-align:center">
+    <h4 style="color:var(--purple);margin:0 0 8px">AI Guard console · "Live" tab</h4>
+    <span class="chip">Live video</span><span class="chip">Rolling captions</span>
+    <span class="chip">Guard speaking / listening</span><span class="chip">"Person interrupted"</span>
+    <span class="chip">Start / Stop</span><span class="chip">Capacity banner</span>
+  </div>
+
+  <div class="arrow">↓ ↑<small>watches live, controls the session</small></div>
+
+  <div class="lab">The appliance on-site (Rioc)</div>
+  <div class="outer">
+    <div class="card slate">
+      <h4>The on-site hub</h4>
+      <p>A small service at the location holds the camera, microphone and speaker. It streams what it sees and hears up to the AI, plays the AI's voice back out, and — crucially — decides <b>locally and instantly</b> when the person starts talking, so interrupting the guard feels immediate even though the AI lives far away.</p>
+      <div class="sig">camera + mic → AI · AI voice → speaker · "they're talking" → stop now</div>
+    </div>
+  </div>
+
+  <div class="arrow">↓ ↑<small>continuous video + audio over the internet</small></div>
+
+  <div class="lab">The AI brain (central, in the cloud)</div>
+  <div class="outer plat">
+    <div class="card cyan" style="margin-bottom:12px">
+      <h4>One live AI session</h4>
+      <p>A single MiniCPM-o model session stays "on the line" for the whole conversation — continuously watching the video and hearing the audio together, and speaking back in real time. This is the leap: not one photo per reply, but a running stream it reasons over.</p>
+    </div>
+    <div class="row">
+      <div class="card red">
+        <h4>The doorman</h4>
+        <p>The shared AI handles many live conversations at once — as many as it can keep genuinely real-time across every location. A traffic director sends each new incident to the least-busy GPU, and capacity grows simply by adding more GPUs to the shared pool. A new incident is only ever turned away when the whole pool is genuinely full — so a rare simultaneous burst never degrades the conversations already in progress.</p>
+      </div>
+      <div class="card green">
+        <h4>The record</h4>
+        <p>Every conversation is saved — what the guard said live, and what the person said (transcribed just afterwards for the log).</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="arrow">↓</div>
+  <div class="dark"><div class="big">A real-time spoken conversation</div><div class="cap">the guard sees the scene change and can be interrupted mid-sentence</div></div>
+</div>
+
+<!-- 2 · LIFECYCLE -->
+<div class="sheet">
+  <h2 class="vtitle">How it works</h2>
+  <p class="vsub">From "someone's there" to a saved conversation</p>
+
+  <div class="step">
+    <div class="badge" style="background:var(--blue)">1</div>
+    <div class="card blue"><h4>Someone is detected</h4>
+      <div class="rp"><b>Reads:</b> the existing person-detection trigger. <b>Produces:</b> a request to start a live conversation.</div>
+      <div class="gate">Not in Live mode? → the proven turn-based guard handles it instead</div>
+    </div>
+  </div>
+  <div class="arrow">↓</div>
+  <div class="step">
+    <div class="badge" style="background:var(--red)">2</div>
+    <div class="card red"><h4>Ask for the AI</h4>
+      <div class="rp"><b>Reads:</b> is the single live slot free? <b>Produces:</b> a granted session — or a refusal.</div>
+      <div class="gate">Already busy? → <span class="pay">capacity_exhausted</span> shown on screen, no guard this time</div>
+    </div>
+  </div>
+  <div class="arrow">↓</div>
+  <div class="step">
+    <div class="badge" style="background:var(--cyan)">3</div>
+    <div class="card cyan"><h4>Open the line</h4>
+      <div class="rp"><b>Reads:</b> the guard persona + voice settings. <b>Produces:</b> a live AI session, primed and listening.</div>
+    </div>
+  </div>
+  <div class="arrow">↓</div>
+  <div class="step">
+    <div class="badge" style="background:var(--blue)">4</div>
+    <div class="card blue"><h4>The live conversation</h4>
+      <div class="rp"><b>Reads:</b> a continuous stream of video + audio. <b>Produces:</b> the guard's spoken replies + on-screen captions, reflecting what's happening <b>right now</b>.</div>
+      <div class="gate">Person starts talking? → guard goes quiet instantly and listens (barge-in)</div>
+    </div>
+  </div>
+  <div class="arrow">↓</div>
+  <div class="step">
+    <div class="badge" style="background:var(--green)">5</div>
+    <div class="card green"><h4>End &amp; record</h4>
+      <div class="rp"><b>Reads:</b> the scene clearing, a time limit, or an operator stop. <b>Produces:</b> a classified, saved conversation.</div>
+    </div>
+  </div>
+
+  <div class="lab" style="margin-top:26px">How it can end</div>
+  <div class="row" style="max-width:660px;margin:0 auto">
+    <div class="card red"><h4>Escalated</h4><p>Reached the final warning.</p></div>
+    <div class="card green"><h4>Left</h4><p>Person engaged, then gone.</p></div>
+    <div class="card slate"><h4>Unknown</h4><p>Guard spoke, no reply.</p></div>
+    <div class="card amber"><h4>Error</h4><p>Connection dropped mid-way.</p></div>
+  </div>
+</div>
+
+<!-- 3 · WHY / TRUST -->
+<div class="sheet">
+  <h2 class="vtitle">Why it feels real</h2>
+  <p class="bar">The AI is far away in the cloud, yet the conversation feels immediate and lifelike. Three choices make that true.</p>
+
+  <div class="row">
+    <div class="card purple"><h4>It sees and hears together</h4><p>One model takes in the live video and the live audio as a single stream — so the guard reacts to what's actually happening, not to a single frozen photo.</p></div>
+    <div class="card blue"><h4>Interrupting is instant</h4><p>The on-site hub hears the person begin to speak and silences the guard immediately — it doesn't wait for a round-trip to the cloud. The AI catches up a moment later; the person never notices the distance.</p></div>
+    <div class="card red"><h4>It never fails quietly</h4><p>If the AI is busy or the link drops, the operator sees it plainly on screen. No pretending a guard is on duty when it isn't.</p></div>
+  </div>
+
+  <div class="lab" style="margin-top:26px">The living loop</div>
+  <div class="loop">
+    <div class="card cyan"><h4>Watch &amp; hear</h4><p>live stream in</p></div>
+    <span class="j">→</span>
+    <div class="card blue"><h4>Speak</h4><p>real-time reply</p></div>
+    <span class="j">→</span>
+    <div class="card amber"><h4>Person reacts</h4><p>talks, moves, leaves</p></div>
+    <span class="j">→</span>
+    <div class="card green"><h4>Adapt</h4><p>guard responds to it</p></div>
+  </div>
+
+  <div class="dark"><div class="big">K concurrent guards</div><div class="cap">as many simultaneous live conversations as the shared GPU can keep real-time — a number we measure on the hardware, serve the whole fleet up to, and grow later by adding GPUs</div></div>
+</div>

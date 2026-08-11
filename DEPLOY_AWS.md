@@ -48,14 +48,14 @@ RunPod bills per second of GPU time; idle = $0.
 ## Architecture (AWS EC2)
 
 ```
-[Mac] webcam_stream.py (GET /video, /transcript)
+[Mac] main.py (GET /video, /transcript)
          │
          │  (expose via Cloudflare Tunnel or ngrok)
          ▼
 [AWS EC2 or RunPod] vLLM (MiniCPM-V-2_6)  ←  cloud_brain.py
 ```
 
-- **Mac**: Must run `webcam_stream.py` and expose it so the cloud can reach it.
+- **Mac**: Must run `main.py` and expose it so the cloud can reach it.
 - **vLLM**: Runs on AWS EC2 (below) or RunPod (above).
 
 ## Part 1: Expose Your Mac Stream
@@ -208,7 +208,7 @@ You should see output like:
 On your Mac, run the webcam stream:
 
 ```bash
-uvicorn webcam_stream:app --host 0.0.0.0 --port 8000
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 Then start the Cloudflare Tunnel (or ngrok) so AWS can reach it.
@@ -216,7 +216,7 @@ Then start the Cloudflare Tunnel (or ngrok) so AWS can reach it.
 **Optional:** Disable local Visual Audit when using Cloud Brain to avoid duplicate audits:
 
 ```bash
-ENABLE_LOCAL_AUDIT=0 ENABLE_AUDIO_STT=1 ENABLE_SPEAKER_TTS=1 uvicorn webcam_stream:app --host 0.0.0.0 --port 8000
+ENABLE_LOCAL_AUDIT=0 ENABLE_AUDIO_STT=1 ENABLE_SPEAKER_TTS=1 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 ---
@@ -271,4 +271,4 @@ The endpoint starts but chat completions return 500. The error is generic; the *
 
 2. **Model name** – Cloud Brain now auto-discovers the model from `/v1/models`. If RunPod uses `OPENAI_SERVED_MODEL_NAME_OVERRIDE`, the discovered name will be used automatically.
 
-3. **Image size** – If logs show OOM during inference, reduce frame size on the Mac: in `webcam_stream.py`, lower `FRAME_SIZE` (e.g. `(384, 384)`) and/or `JPEG_QUALITY`.
+3. **Image size** – If logs show OOM during inference, reduce frame size on the Mac: in `main.py`, lower `FRAME_SIZE` (e.g. `(384, 384)`) and/or `JPEG_QUALITY`.

@@ -70,21 +70,32 @@ async def chat(
     system_prompt: str,
     conversation_history: list[dict[str, Any]],
     audio_bytes: bytes | None = None,
+    user_text: str | None = None,
 ) -> tuple[str, bytes | None]:
     """Send a frame (+ optional audio) to MiniCPM-o and return (text, wav_bytes).
 
     conversation_history is a list of {"role": "user"|"assistant", "content": ...} dicts
     representing prior turns. The current frame/audio are appended as the latest user turn.
+
+    user_text: optional text instruction prepended to the current user message content.
+    Use this to re-anchor the model's role on every turn and prevent persona drift when
+    the model sees a bare image with no text context.
+
     Falls back to CLOUD_AI_URL when MINICPMO_URL returns an error.
     """
     # Build the current user message content
     b64_image = base64.standard_b64encode(jpeg_bytes).decode("ascii")
-    content: list[dict[str, Any]] = [
+    content: list[dict[str, Any]] = []
+    # Prepend role-anchoring text before the image so the model knows what to do
+    # with the frame rather than defaulting to neutral image description.
+    if user_text:
+        content.append({"type": "text", "text": user_text})
+    content.append(
         {
             "type": "image_url",
             "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"},
         }
-    ]
+    )
     if audio_bytes:
         b64_audio = base64.standard_b64encode(audio_bytes).decode("ascii")
         content.append(
