@@ -1,0 +1,55 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PR review",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["review_markdown", "findings"],
+  "properties": {
+    "review_markdown": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The sticky review comment, verbatim. Must carry <!-- score: N --> and the full head SHA."
+    },
+    "findings": {
+      "type": "array",
+      "description": "Inline comments, one per changed line worth commenting on.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "line", "severity", "body"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Repo-relative path, exactly as it appears in files.txt."
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Line in the new file, or in the old file when side is LEFT."
+          },
+          "start_line": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "First line of a multi-line comment; must be <= line."
+          },
+          "side": {
+            "type": "string",
+            "enum": ["LEFT", "RIGHT"],
+            "description": "RIGHT (the default) is the new file, LEFT the old one."
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["P0", "P1", "P2"],
+            "description": "P0 blocks the merge, P1 should be fixed, P2 is optional."
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The comment text, in Markdown."
+          }
+        }
+      }
+    }
+  }
+}

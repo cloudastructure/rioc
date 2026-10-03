@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Recomposed review body",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["review_markdown"],
+  "properties": {
+    "review_markdown": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The sticky review comment, verbatim, with the rejected findings removed. Must still carry <!-- score: N --> and the full head SHA."
+    }
+  }
+}

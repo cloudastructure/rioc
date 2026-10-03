@@ -1,0 +1,45 @@
+name: Review Bot Tests
+
+on:
+  pull_request:
+    paths:
+      - '.github/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: review-bot-tests-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reviewer-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Lint reviewer scripts and validate JSON
+        run: |
+          for file in .github/claude/*.sh; do
+            bash -n "$file"
+            shellcheck -S warning "$file"
+          done
+          for file in .github/claude/*.json; do
+            jq empty "$file"
+          done
+      - name: Run reviewer regression tests
+        run: |
+          node --test .github/claude/*.test.mjs
+          for file in .github/claude/*.test.sh; do
+            bash "$file"
+          done

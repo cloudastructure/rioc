@@ -1,0 +1,92 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git grep:*)",
+      "Bash(git blame:*)",
+      "Bash(git ls-files:*)",
+      "Bash(git status:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(grep:*)",
+      "Bash(rg:*)",
+      "Bash(cat:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(wc:*)",
+      "Bash(ls:*)",
+      "Bash(jq:*)",
+      "Bash(sort:*)",
+      "Bash(cut:*)",
+      "Bash(tr:*)",
+      "Bash(diff:*)",
+      "Bash(test:*)"
+    ],
+    "deny": [
+      "Read(.git/**)",
+      "Read(**/.git/**)",
+      "Read(/proc/**)",
+      "Read(~/.gitconfig)",
+      "Read(~/.claude/**)",
+      "Read(~/.config/**)",
+      "Read(/home/**)",
+      "Read(/root/**)",
+      "Read(/var/**)",
+      "Read(/etc/**)",
+      "Read(/run/**)",
+      "Read(/sys/**)",
+      "Read(/usr/**)",
+      "Read(/opt/**)",
+      "Read(/tmp/**)",
+      "Read(/dev/**)",
+      "Write",
+      "Edit",
+      "NotebookEdit",
+      "Task",
+      "WebFetch",
+      "WebSearch",
+      "Bash(curl:*)",
+      "Bash(wget:*)",
+      "Bash(gh:*)",
+      "Bash(sh:*)",
+      "Bash(bash:*)",
+      "Bash(zsh:*)",
+      "Bash(node:*)",
+      "Bash(npm:*)",
+      "Bash(npx:*)",
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(sed:*)",
+      "Bash(awk:*)",
+      "Bash(find:*)",
+      "Bash(xargs:*)",
+      "Bash(tee:*)",
+      "Bash(env:*)",
+      "Bash(eval:*)",
+      "Bash(git push:*)",
+      "Bash(git config:*)",
+      "Bash(git checkout:*)",
+      "Bash(git commit:*)",
+      "Bash(rg --pre:*)",
+      "Bash(sort -o:*)",
+      "Bash(git grep -O:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_HOOK_DIR:-.github/claude}/deny-shell-escapes.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}

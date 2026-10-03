@@ -1,0 +1,1203 @@
+name: Claude Code
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, assigned]
+  pull_request_review:
+    types: [submitted]
+  pull_request:
+    # synchronize excluded — auto-review runs once on open.
+    # Follow-up reviews are triggered via @claude in comments.
+    types: [opened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to review'
+        required: true
+        type: string
+
+# Change the Actions variable, not this file. The fallbacks are what the bot runs
+# with today, so nothing changes until someone sets the variable, and a model or
+# effort change then ships without editing a workflow.
+env:
+  CLAUDE_REVIEW_MODEL: ${{ vars.CLAUDE_REVIEW_MODEL || 'claude-opus-5' }}
+  CLAUDE_REVIEW_EFFORT: ${{ vars.CLAUDE_REVIEW_EFFORT || 'high' }}
+
+jobs:
+  # Runs once when a PR is opened or converted from draft, or manually via workflow_dispatch.
+  auto-review:
+    # Rename + ruleset change together when this becomes a required check.
+    name: "auto-review (advisory — not a merge gate)"
+    # Humans always. Among bots, only `claude[bot]`: the Sentry Daily Fix opens real product
+    # fixes from automation and those are exactly the PRs that most need a review, since nobody
+    # wrote the code. Every other bot stays out rather than being admitted by default — this job
+    # is a 45-minute Opus run, and a future release-bumper or changelog bot opening PRs would
+    # otherwise start burning that on diffs with no logic to reason about. dependabot is named
+    # separately because it was already excluded and the reason is its own: a dependency bump.
+    #
+    # Keyed on `pull_request.user.login`, NOT `github.actor`. `github.actor` is whoever triggered
+    # the event, which for `ready_for_review` is the human who clicked the button — so an
+    # actor-keyed rule skips a claude[bot] PR the moment a person marks it ready, which is the
+    # exact opposite of the intent above. Verified against the API: for these PRs
+    # `pull_request.user.login` is `claude[bot]` and `.user.type` is `Bot`.
+    #
+    # Drafts are still skipped; `ready_for_review` is in the event list above, so marking a
+    # draft ready runs the review then.
+    if: |
+      (github.event_name == 'pull_request' &&
+      !github.event.pull_request.draft &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      (github.event.pull_request.user.type != 'Bot' ||
+       github.event.pull_request.user.login == 'claude[bot]')) ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Serialize eligible reviewer jobs per PR so a re-trigger sees the first
+    # run's sticky update; job-level scope excludes skipped events and status.
+    # The active review finishes; a newer pending request replaces the previous
+    # pending request.
+    concurrency:
+      group: claude-review-${{ github.event.issue.number || github.event.pull_request.number || inputs.pr_number || github.run_id }}
+      cancel-in-progress: false
+    # No checks:write — AI step has GH_TOKEN + Bash; spoof risk. See review-status job.
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    outputs:
+      infra_failure: ${{ steps.outcome_gate.outputs.infra_failure }}
+      head_sha: ${{ steps.outcome_gate.outputs.head_sha }}
+      failure_summary: ${{ steps.update_progress.outputs.failure_summary }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          # Keep the token out of .git/config. The model steps below get a shell
+          # in this tree, and actions/checkout otherwise persists the token there
+          # as an http.extraheader. The steps that still have to fetch get their
+          # credentials from the gh helper instead — see the bootstrap below.
+          persist-credentials: false
+
+      # Ahead of the restore below because that restore fetches origin/main, and
+      # persist-credentials: false left no token in .git/config for it. This runs
+      # the tree's copy of the script: on a pull_request event that is the PR
+      # author's, and there the workflow file is the PR's too, so nothing widens;
+      # on a comment trigger the tree here is still the default branch's, since
+      # the PR head is not checked out until later.
+      - name: Ensure GitHub CLI is available
+        run: bash .github/claude/ensure-gh.sh
+
+      # `gh auth setup-git` writes one thing into the runner user's global git
+      # config — `credential.https://github.com.helper=!gh auth git-credential` —
+      # and that helper answers with the GH_TOKEN in the environment of the git
+      # process that runs it (both measured 2026-09-02, gh 2.98.0). No token is
+      # written to disk, and a step without GH_TOKEN cannot fetch. It does not
+      # bound the model, which gets a token from the action either way; see the
+      # review step below.
+      - name: Authenticate git through the GitHub CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh auth setup-git
+
+      # SECURITY: on a pull_request event the checked-out tree — and the helper
+      # scripts and prompts in it — belong to the PR author. Overwrite them with
+      # main's copies before anything reads or executes them, so a PR cannot
+      # rewrite the instructions it is reviewed by, or the shell that runs beside
+      # this runner's tokens. This is the same posture the reviewer already had
+      # when it loaded its prompt from origin/main; the restore widens it to the
+      # scripts, and leaves a snapshot outside the tree for the steps that run
+      # after the model has had a shell.
+      - name: Load trusted bot files from origin/main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/claude/load-trusted-files.sh
+
+      # The restore above hands the job main's copy of .github/claude and deletes
+      # every file this branch adds there, so on the PR that INTRODUCES one of
+      # the bot's own scripts the job then invokes a file that is no longer on
+      # disk (run 33681911020: prepare-review-metadata.sh, exit 127, and every
+      # later step failed the same way with no comment on the PR). Say it once
+      # and skip the rest of the job green: this PR is reviewed after it merges,
+      # by the bot it ships.
+      - name: Check the trusted bot files are complete
+        id: bot_files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          MISSING=""
+          for f in prepare-review-metadata.sh prepare-review-inputs.sh \
+                   publish-review.sh publisher-auth.mjs verify-published-review.sh review-outcome-gate.sh update-progress.sh extract-usage.sh \
+                   update-usage-ledger.sh deny-shell-escapes.sh settings.json \
+                   review-schema.json verdicts-schema.json recompose-schema.json \
+                   review-prompt.md verify-findings-prompt.md recompose-review-prompt.md; do
+            if [ ! -f ".github/claude/$f" ] || ! git cat-file -e "origin/main:.github/claude/$f" 2>/dev/null; then
+              MISSING="$MISSING, .github/claude/$f"
+            fi
+          done
+          MISSING="${MISSING#, }"
+          if [ -z "$MISSING" ]; then
+            echo "missing=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "missing=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::Missing after the restore from origin/main: $MISSING"
+          # No alternate publishing identity during bootstrap. The workflow
+          # summary explains the missing trusted files without posting as Actions.
+          printf 'Claude review cannot run until these trusted files exist on main: %s\n' "$MISSING" >> "$GITHUB_STEP_SUMMARY"
+
+      # Separate from the model action's revoked output token. Only trusted
+      # publishing steps receive this token; cleanup runs even after failure.
+      - name: Set up publisher runtime
+        if: steps.bot_files.outputs.missing != 'true'
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Authenticate the Claude publisher
+        id: publisher_auth
+        if: steps.bot_files.outputs.missing != 'true'
+        run: node "$RUNNER_TEMP/claude-trusted/.github/claude/publisher-auth.mjs" acquire
+
+      - name: Prepare review metadata and post progress indicator
+        if: steps.bot_files.outputs.missing != 'true'
+        env:
+          GH_TOKEN: ${{ steps.publisher_auth.outputs.token }}
+        run: bash .github/claude/prepare-review-metadata.sh
+
+      # On every auto-review, not just a dispatched one. A pull_request checkout
+      # is the PR's MERGE ref, which carries base commits the diff does not, and
+      # a workflow_dispatch checkout is whatever ref was dispatched, which is
+      # almost never the PR being reviewed. Either way the fetched diff would be
+      # the right one while every grep for callers searched a different tree, and
+      # the cross-file impact step is most of the review's value. The reported
+      # SHA is $HEAD_SHA, so the tree has to be $HEAD_SHA too.
+      - name: Check out the PR head
+        if: steps.bot_files.outputs.missing != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --no-tags origin "pull/$PR_NUMBER/head:claude-review-head"
+          # The SHA the metadata step captured, not the branch tip: a push
+          # between the two would review a tree the reported SHA does not
+          # describe.
+          if ! git checkout -f "$HEAD_SHA"; then
+            echo "::error::PR #$PR_NUMBER moved past $HEAD_SHA before checkout"
+            exit 1
+          fi
+          # The snapshot, not the tree copy — see the mention job for why.
+          bash "$RUNNER_TEMP/claude-trusted/.github/claude/load-trusted-files.sh"
+
+      # Everything the reviewer reads about the PR is fetched here, by a step that
+      # holds the token, and written to $REVIEW_IN. The model step below then runs
+      # with no token of its own at all.
+      - name: Prepare review inputs
+        if: steps.bot_files.outputs.missing != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IS_PR: 'true'
+          REVIEW_MODE: first
+        run: bash .github/claude/prepare-review-inputs.sh
+
+      - name: Load review prompts from base branch
+        if: steps.bot_files.outputs.missing != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # SECURITY: load prompts from origin/main only (PR tree can rewrite them).
+          if ! git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main; then
+            echo "::error::Failed to fetch origin/main for review-prompt load"
+            exit 1
+          fi
+          load_prompt() {
+            VAR="$1"
+            PROMPT_PATH="$2"
+            if ! git show "origin/main:$PROMPT_PATH" > /tmp/prompt.md 2>/dev/null; then
+              echo "::error::Could not load $PROMPT_PATH from origin/main"
+              exit 1
+            fi
+            echo "Loaded $PROMPT_PATH from origin/main ($(wc -c < /tmp/prompt.md | tr -d ' ') bytes)"
+            # The model's Read tool takes a literal path and never expands a
+            # variable, and its Bash hook denies echo and printenv, so the prompt
+            # carries the absolute paths instead of $REVIEW_IN / $REVIEW_OUT.
+            awk -v in_dir="$REVIEW_IN" -v out_dir="$REVIEW_OUT" '
+              { gsub(/\$[{]REVIEW_IN[}]|\$REVIEW_IN/, in_dir)
+                gsub(/\$[{]REVIEW_OUT[}]|\$REVIEW_OUT/, out_dir)
+                print }
+            ' /tmp/prompt.md > /tmp/prompt.subst.md
+            mv /tmp/prompt.subst.md /tmp/prompt.md
+            # Random heredoc delimiter so prompt content can't terminate GITHUB_ENV early.
+            ATTEMPT=0
+            while [ "$ATTEMPT" -lt 3 ]; do
+              if ! RANDOM_HEX=$(openssl rand -hex 16); then
+                echo "::error::Failed to generate random heredoc delimiter"
+                exit 1
+              fi
+              DELIM="EOF_$RANDOM_HEX"
+              if ! grep -Fq "$DELIM" /tmp/prompt.md; then
+                break
+              fi
+              ATTEMPT=$((ATTEMPT + 1))
+            done
+            if [ "$ATTEMPT" -ge 3 ]; then
+              echo "::error::Could not generate unique heredoc delimiter after 3 attempts"
+              exit 1
+            fi
+            {
+              echo "$VAR<<$DELIM"
+              cat /tmp/prompt.md
+              echo "$DELIM"
+            } >> "$GITHUB_ENV"
+          }
+          load_prompt REVIEW_PROMPT .github/claude/review-prompt.md
+          load_prompt VERIFY_PROMPT .github/claude/verify-findings-prompt.md
+          load_prompt RECOMPOSE_PROMPT .github/claude/recompose-review-prompt.md
+
+      # The schemas travel to the CLI inside claude_args, SINGLE-quoted. The action
+      # parses claude_args with shell-quote (base-action/src/parse-sdk-options.ts:139),
+      # so quoting decides whether the value survives: replayed against that file's
+      # escape/unescape logic, the double-quoted form came back with the `$schema` key
+      # expanded away, the bare form came back stripped of its quotes and no longer
+      # parseable, and only the single-quoted form round-tripped byte for byte. The
+      # files are main's copies: the restore step above put them here.
+      - name: Load the structured-output schemas
+        if: steps.bot_files.outputs.missing != 'true'
+        run: |
+          load_schema_arg() {
+            VAR="$1"
+            SCHEMA_PATH="$2"
+            if ! COMPACT=$(jq -c . "$SCHEMA_PATH" 2>/dev/null); then
+              echo "::error::$SCHEMA_PATH is missing or not valid JSON"
+              exit 1
+            fi
+            # An apostrophe would close the single quote around the value, so each
+            # one is re-emitted as '\'', the way a literal ' survives a
+            # single-quoted shell token, and what shell-quote parses it back to.
+            echo "$VAR=$(printf '%s' "$COMPACT" | sed "s/'/'\\\\''/g")" >> "$GITHUB_ENV"
+          }
+          load_schema_arg REVIEW_SCHEMA_ARG .github/claude/review-schema.json
+          load_schema_arg VERDICTS_SCHEMA_ARG .github/claude/verdicts-schema.json
+          load_schema_arg RECOMPOSE_SCHEMA_ARG .github/claude/recompose-schema.json
+
+      # No GH_TOKEN here: the model reads $REVIEW_IN and returns its review as
+      # structured output, and the publish step below is what talks to GitHub. A
+      # token in this step is a write primitive for anything the PR's own text
+      # talks the model into.
+      #
+      # It is not a complete removal, and that is what settings.json is for: the
+      # action sets process.env.GITHUB_TOKEN and process.env.GH_TOKEN to its own
+      # token (src/entrypoints/run.ts:189-190) and then hands the CLI a copy of
+      # process.env (base-action/src/parse-sdk-options.ts:279), so a GitHub token
+      # reaches the model's shell no matter what this block says. Three things
+      # bound it instead: the `gh` deny in .github/claude/settings.json, the Bash
+      # hook that file installs, and publish-review.sh refusing token-shaped text
+      # in what it posts. What the checkout no longer leaves behind is a fourth
+      # copy of a token in .git/config (persist-credentials: false above).
+      #
+      # CLAUDE_HOOK_DIR points the hook at the snapshot rather than the tree: the
+      # tree's .github/claude is main's copy right now, but this step is where
+      # that stops being guaranteed.
+      - name: Run Claude Code PR Review
+        id: claude_review
+        if: steps.bot_files.outputs.missing != 'true'
+        # Pinned to a commit SHA, not the v1 tag: a mutable tag would let a moved action bypass every in-repo guard. Bump this pin by PR.
+        uses: anthropics/claude-code-action@fa2b2666b747000bf42767d1f332065b375e3c8f # v1.0.214
+        continue-on-error: true
+        env:
+          PR_NUMBER: ${{ env.PR_NUMBER }}
+          HEAD_SHA: ${{ env.HEAD_SHA }}
+          SHORT_SHA: ${{ env.SHORT_SHA }}
+          REVIEW_NUMBER: ${{ env.REVIEW_NUMBER }}
+          COMMIT_MSG: ${{ env.COMMIT_MSG }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          REVIEW_IN: ${{ env.REVIEW_IN }}
+          REVIEW_OUT: ${{ env.REVIEW_OUT }}
+          REVIEW_MODE: first
+          CLAUDE_HOOK_DIR: ${{ runner.temp }}/claude-trusted/.github/claude
+        with:
+          # Only the trusted fix bot; this does not admit bot-written comments.
+          allowed_bots: "claude[bot]"
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ env.REVIEW_PROMPT }}
+          # Points at the trusted snapshot, not the working tree: this step's model has a
+          # shell in the tree, so a write to .github/claude/settings.json there (the hook
+          # is the only thing stopping it) would change the policy verify/recompose load.
+          settings: ${{ runner.temp }}/claude-trusted/.github/claude/settings.json
+          # MCP tools (Sentry, Jira, Jenkins) excluded — no credentials in CI
+          claude_args: --model ${{ env.CLAUDE_REVIEW_MODEL }} --effort ${{ env.CLAUDE_REVIEW_EFFORT }} --max-turns 120 --disallowed-tools Task,WebFetch,WebSearch,Write,Edit,MultiEdit,NotebookEdit --json-schema '${{ env.REVIEW_SCHEMA_ARG }}'
+
+      # Through env:, never inlined into the script body: this is model output,
+      # and a `$(` in it would otherwise run on this runner.
+      - name: Capture the review
+        id: capture_review
+        if: always() && steps.bot_files.outputs.missing != 'true' && steps.claude_review.outcome == 'success'
+        continue-on-error: true
+        env:
+          STRUCTURED_OUTPUT: ${{ steps.claude_review.outputs.structured_output }}
+        run: |
+          if [ -z "${STRUCTURED_OUTPUT:-}" ]; then
+            echo "::error::The review step returned no structured output; nothing to publish"
+            exit 1
+          fi
+          printf '%s' "$STRUCTURED_OUTPUT" > "$REVIEW_OUT/review.json"
+          if ! jq empty "$REVIEW_OUT/review.json" 2>/dev/null; then
+            echo "::error::The review step's structured output is not valid JSON"
+            exit 1
+          fi
+          echo "Captured review.json ($(wc -c < "$REVIEW_OUT/review.json" | tr -d ' ') bytes, $(jq '.findings | length' "$REVIEW_OUT/review.json") findings)"
+          echo "has_findings=$(jq '.findings | length > 0' "$REVIEW_OUT/review.json")" >> "$GITHUB_OUTPUT"
+
+      # Before the verifier runs, not after: the execution file has a fixed name
+      # under RUNNER_TEMP (base-action/src/execution-file.ts:6,12), so the verifier
+      # step below overwrites the review's copy.
+      - name: Extract review usage
+        if: always() && steps.bot_files.outputs.missing != 'true' && env.REVIEW_OUT != ''
+        env:
+          EXECUTION_FILE: ${{ steps.claude_review.outputs.execution_file }}
+        run: bash "$RUNNER_TEMP/claude-trusted/.github/claude/extract-usage.sh" review
+
+      # A second opinion on the first pass's own findings, with no authority to
+      # add any. The publisher drops the ones this pass cannot support.
+      - name: Verify the review findings
+        id: claude_verify
+        if: always() && steps.bot_files.outputs.missing != 'true' && steps.capture_review.outcome == 'success' && steps.capture_review.outputs.has_findings == 'true'
+        uses: anthropics/claude-code-action@fa2b2666b747000bf42767d1f332065b375e3c8f # v1.0.214
+        continue-on-error: true
+        env:
+          REVIEW_IN: ${{ env.REVIEW_IN }}
+          REVIEW_OUT: ${{ env.REVIEW_OUT }}
+          CLAUDE_HOOK_DIR: ${{ runner.temp }}/claude-trusted/.github/claude
+        with:
+          # Only the trusted fix bot; this does not admit bot-written comments.
+          allowed_bots: "claude[bot]"
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ env.VERIFY_PROMPT }}
+          settings: ${{ runner.temp }}/claude-trusted/.github/claude/settings.json
+          claude_args: --model ${{ env.CLAUDE_REVIEW_MODEL }} --effort ${{ env.CLAUDE_REVIEW_EFFORT }} --max-turns 40 --disallowed-tools Task,WebFetch,WebSearch,Write,Edit,MultiEdit,NotebookEdit --json-schema '${{ env.VERDICTS_SCHEMA_ARG }}'
+
+      # A warning, not a failure: with no verdicts file the publisher posts every
+      # finding, which is what the bot did before this pass existed.
+      - name: Capture the verdicts
+        id: capture_verdicts
+        if: always() && steps.bot_files.outputs.missing != 'true' && steps.capture_review.outcome == 'success' && steps.capture_review.outputs.has_findings == 'true'
+        continue-on-error: true
+        env:
+          STRUCTURED_OUTPUT: ${{ steps.claude_verify.outputs.structured_output }}
+        run: |
+          if [ -z "${STRUCTURED_OUTPUT:-}" ]; then
+            echo "::warning::The verifier returned no structured output; every finding will be posted"
+            exit 0
+          fi
+          printf '%s' "$STRUCTURED_OUTPUT" > "$REVIEW_OUT/verdicts.json"
+          if ! jq -e 'type == "object" and (.verdicts | type == "array") and
+              all(.verdicts[]; (.index | type == "number") and .index >= 0 and .index == (.index | floor)
+                and (.supported | type == "boolean") and (.reason | type == "string"))' \
+              "$REVIEW_OUT/verdicts.json" > /dev/null 2>&1; then
+            echo "::warning::The verifier's structured output is not a valid verdicts object; every finding will be posted"
+            rm -f "$REVIEW_OUT/verdicts.json"
+            exit 0
+          fi
+          echo "valid=true" >> "$GITHUB_OUTPUT"
+          echo "Captured verdicts.json ($(jq '[.verdicts[] | select(.supported | not)] | length' "$REVIEW_OUT/verdicts.json") of $(jq '.verdicts | length' "$REVIEW_OUT/verdicts.json") findings not supported)"
+
+      # Only when the verifier actually ran. A skipped step has no execution_file
+      # output, so this would write a usage-verify.json of `unknown`, and one
+      # unknown pass makes the whole run's totals unknown in the ledger
+      # (update-usage-ledger.sh, `field()`), marking the available total incomplete.
+      - name: Extract verifier usage
+        if: always() && steps.bot_files.outputs.missing != 'true' && env.REVIEW_OUT != '' && steps.claude_verify.outcome != 'skipped'
+        env:
+          EXECUTION_FILE: ${{ steps.claude_verify.outputs.execution_file }}
+        run: bash "$RUNNER_TEMP/claude-trusted/.github/claude/extract-usage.sh" verify
+
+      # The publisher drops every finding the verifier rejected, which leaves the
+      # body's own Files changed table, Blockers list and score describing
+      # findings nobody will see. This counts the rejections so the pass below
+      # runs only when there are any. Mirrors publish-review.sh's own rule
+      # (verdict_of): the LAST verdict entry for an index wins, and a finding
+      # with no verdict entry is rejected too, not just one whose last verdict
+      # has supported == false, so a `{"verdicts": []}` response counts as
+      # rejecting everything here exactly as it does in the publisher.
+      - name: Count the rejected findings
+        if: always() && steps.bot_files.outputs.missing != 'true' && steps.capture_review.outcome == 'success'
+        run: |
+          REJECTED=0
+          if [ -s "$REVIEW_OUT/verdicts.json" ]; then
+            REJECTED=$(jq -n --slurpfile r "$REVIEW_OUT/review.json" --slurpfile v "$REVIEW_OUT/verdicts.json" \
+              '[range(0; ($r[0].findings | length)) as $i
+                | select((([$v[0].verdicts[]? | select(.index == $i)] | last | .supported) // false) != true)]
+               | length' 2>/dev/null || echo 0)
+          fi
+          echo "REJECTED_COUNT=$REJECTED" >> "$GITHUB_ENV"
+          echo "Rejected findings: $REJECTED"
+
+      # Rewrites the review body from the findings that survived. --resume is not
+      # a flag the action claims, and that is what makes this possible: it parses
+      # claude_args into extraArgs and passes every flag it does not claim
+      # straight to the CLI (base-action/src/parse-sdk-options.ts:152-183 builds
+      # extraArgs, :330 hands it to the SDK; only model, max-turns, add-dir,
+      # allowed/disallowed-tools and setting-sources are deleted on the way). So
+      # this pass reuses the review's own session and still has the diff it read.
+      # Empty session_id is excluded rather than passed: --resume would otherwise
+      # swallow the next flag as its value.
+      - name: Recompose the review without the rejected findings
+        id: claude_recompose
+        if: >-
+          always() &&
+          steps.bot_files.outputs.missing != 'true' &&
+          steps.capture_review.outcome == 'success' &&
+          env.REJECTED_COUNT != '' &&
+          env.REJECTED_COUNT != '0' &&
+          steps.claude_review.outputs.session_id != ''
+        uses: anthropics/claude-code-action@fa2b2666b747000bf42767d1f332065b375e3c8f # v1.0.214
+        continue-on-error: true
+        env:
+          HEAD_SHA: ${{ env.HEAD_SHA }}
+          REVIEW_IN: ${{ env.REVIEW_IN }}
+          REVIEW_OUT: ${{ env.REVIEW_OUT }}
+          CLAUDE_HOOK_DIR: ${{ runner.temp }}/claude-trusted/.github/claude
+        with:
+          # Only the trusted fix bot; this does not admit bot-written comments.
+          allowed_bots: "claude[bot]"
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ env.RECOMPOSE_PROMPT }}
+          settings: ${{ runner.temp }}/claude-trusted/.github/claude/settings.json
+          claude_args: --model ${{ env.CLAUDE_REVIEW_MODEL }} --effort ${{ env.CLAUDE_REVIEW_EFFORT }} --max-turns 10 --resume ${{ steps.claude_review.outputs.session_id }} --disallowed-tools Task,WebFetch,WebSearch,Write,Edit,MultiEdit,NotebookEdit --json-schema '${{ env.RECOMPOSE_SCHEMA_ARG }}'
+
+      # A warning, never a failure: on any doubt review.json is left exactly as
+      # the review wrote it, and the publisher posts that body with its own Low
+      # confidence list — which is what this job did before this pass existed.
+      - name: Capture the recomposed review
+        id: capture_recompose
+        if: always() && steps.bot_files.outputs.missing != 'true' && steps.claude_recompose.outcome == 'success'
+        continue-on-error: true
+        env:
+          STRUCTURED_OUTPUT: ${{ steps.claude_recompose.outputs.structured_output }}
+        run: |
+          RECOMPOSED="$RUNNER_TEMP/recomposed.json"
+          MERGED="$RUNNER_TEMP/review-recomposed.json"
+          BODY="$RUNNER_TEMP/recomposed-body.md"
+          if [ -z "${STRUCTURED_OUTPUT:-}" ]; then
+            echo "::warning::The recompose pass returned no structured output; posting the review body as first written"
+            exit 0
+          fi
+          printf '%s' "$STRUCTURED_OUTPUT" > "$RECOMPOSED"
+          if ! jq -e '.review_markdown | type == "string"' "$RECOMPOSED" > /dev/null 2>&1; then
+            echo "::warning::The recompose pass returned no review_markdown string; posting the review body as first written"
+            exit 0
+          fi
+          jq -r '.review_markdown' "$RECOMPOSED" > "$BODY"
+          if ! grep -q '[^[:space:]]' "$BODY" \
+            || ! grep -qF '<!-- score:' "$BODY" \
+            || ! grep -qF "$HEAD_SHA" "$BODY"; then
+            echo "::warning::The recomposed body is empty or does not carry the score marker and $HEAD_SHA; posting the review body as first written"
+            exit 0
+          fi
+          if ! jq --slurpfile recomposed "$RECOMPOSED" \
+              '.review_markdown = $recomposed[0].review_markdown' \
+              "$REVIEW_OUT/review.json" > "$MERGED"; then
+            echo "::warning::Could not merge the recomposed body into review.json; posting the review body as first written"
+            exit 0
+          fi
+          mv "$MERGED" "$REVIEW_OUT/review.json"
+          echo "valid=true" >> "$GITHUB_OUTPUT"
+          echo "Recomposed the review body ($(wc -c < "$BODY" | tr -d ' ') bytes) around $REJECTED_COUNT rejected finding(s)"
+
+      # Same seat, same usage window as the other two passes, so it gets a row of
+      # its own; update-usage-ledger.sh sums every usage-*.json it finds.
+      - name: Extract recompose usage
+        if: always() && steps.bot_files.outputs.missing != 'true' && env.REVIEW_OUT != '' && steps.claude_recompose.outcome != 'skipped'
+        env:
+          EXECUTION_FILE: ${{ steps.claude_recompose.outputs.execution_file }}
+        run: bash "$RUNNER_TEMP/claude-trusted/.github/claude/extract-usage.sh" recompose
+
+      # SECURITY: from the snapshot, not the tree — the model steps above had a
+      # shell, so the tree is no longer trustworthy afterwards.
+      - name: Determine review completeness
+        if: always() && env.REVIEW_OUT != '' && steps.capture_review.outcome == 'success'
+        env:
+          HAS_FINDINGS: ${{ steps.capture_review.outputs.has_findings }}
+          VERDICTS_VALID: ${{ steps.capture_verdicts.outputs.valid }}
+          RECOMPOSE_VALID: ${{ steps.capture_recompose.outputs.valid }}
+        run: |
+          INCOMPLETE=false
+          if [ "${IS_PR:-true}" = "true" ]; then
+            if [ "$HAS_FINDINGS" != "false" ] && [ "$VERDICTS_VALID" != "true" ]; then INCOMPLETE=true; fi
+            if [ "${REJECTED_COUNT:-0}" != "0" ] && [ "$RECOMPOSE_VALID" != "true" ]; then INCOMPLETE=true; fi
+          fi
+          echo "REVIEW_INCOMPLETE=$INCOMPLETE" >> "$GITHUB_ENV"
+
+      - name: Publish review
+        id: publish_review
+        if: always() && steps.bot_files.outputs.missing != 'true' && steps.capture_review.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.publisher_auth.outputs.token }}
+          IS_PR: 'true'
+        run: bash "$RUNNER_TEMP/claude-trusted/.github/claude/publish-review.sh"
+
+      # always() also covers cancellation, which is why GitHub recommends
+      # !cancelled() when you do NOT want that: a review cancelled partway still
+      # spent tokens and still gets a row.
+      # No inputs prepared means no model ran, so there is nothing to record: a
+      # stale re-request would otherwise add a row of "unknown".
+      - name: Update usage ledger
+        if: always() && steps.bot_files.outputs.missing != 'true' && env.REVIEW_OUT != ''
+        env:
+          GH_TOKEN: ${{ steps.publisher_auth.outputs.token }}
+          CLAUDE_MODEL: ${{ env.CLAUDE_REVIEW_MODEL }}
+          CLAUDE_EFFORT: ${{ env.CLAUDE_REVIEW_EFFORT }}
+        run: bash "$RUNNER_TEMP/claude-trusted/.github/claude/update-usage-ledger.sh"
+
+      - name: Verify review was posted
+        continue-on-error: true
+        id: verify_posted
+        if: always() && steps.bot_files.outputs.missing != 'true'
+        env:
+          GH_TOKEN: ${{ steps.publisher_auth.outputs.token }}
+          MODEL_OUTCOME: ${{ steps.claude_review.outcome }}
+          CAPTURE_OUTCOME: ${{ steps.capture_review.outcome }}
+          PUBLISH_OUTCOME: ${{ steps.publish_review.outcome }}
+          IS_PR: 'true'
+        run: bash "$RUNNER_TEMP/claude-trusted/.github/claude/verify-published-review.sh"
+
+      - name: Update progress indicator
+        id: update_progress
+        if: always() && steps.bot_files.outputs.missing != 'true'
+        env:
+          GH_TOKEN: ${{ steps.publisher_auth.outputs.token }}
+          REVIEW_OUTCOME: ${{ (steps.claude_review.outcome == 'success' && steps.capture_review.outcome == 'success' && steps.publish_review.outcome == 'success') && 'success' || 'failure' }}
+          MODEL_OUTCOME: ${{ steps.claude_review.outcome }}
+          MODEL_EXECUTION_FILE: ${{ steps.claude_review.outputs.execution_file }}
+          CAPTURE_OUTCOME: ${{ steps.capture_review.outcome }}
+          PUBLISH_OUTCOME: ${{ steps.publish_review.outcome }}
+          # Same reason as the mention job: without it, a run that posted nothing
+          # reads the newest score comment — the PREVIOUS review's — and renders
+          # it as this run's result.
+          RESPONSE_MISSING: ${{ steps.verify_posted.outputs.review_missing }}
+          PROGRESS_VERB: Review
+        run: bash "$RUNNER_TEMP/claude-trusted/.github/claude/update-progress.sh"
+
+      # INFRA failure → green here, neutral check via review-status (has checks:write).
+      # STRUCTURAL (missing review/score) → red.
+      - name: Fail job if review failed
+        id: outcome_gate
+        if: always() && steps.bot_files.outputs.missing != 'true'
+        env:
+          GATE_MODE: auto
+          PUBLISHER_OUTCOME: ${{ steps.publisher_auth.outcome }}
+          MODEL_OUTCOME: ${{ steps.claude_review.outcome }}
+          CAPTURE_OUTCOME: ${{ steps.capture_review.outcome }}
+          REVIEW_MISSING: ${{ steps.verify_posted.outputs.review_missing }}
+          SCORE_MISSING: ${{ steps.update_progress.outputs.score_missing }}
+        run: bash "$RUNNER_TEMP/claude-trusted/.github/claude/review-outcome-gate.sh"
+
+      - name: Revoke the Claude publisher token
+        if: always() && steps.publisher_auth.outputs.token != ''
+        env:
+          CLAUDE_PUBLISH_TOKEN: ${{ steps.publisher_auth.outputs.token }}
+        run: node "$RUNNER_TEMP/claude-trusted/.github/claude/publisher-auth.mjs" revoke
+
+  # checks:write isolated from the AI job (token isolation).
+  # Posts a grey Checks-API marker named "Claude auto-review — did not run" (not typecheck).
+  review-status:
+    name: "Claude auto-review status"
+    needs: auto-review
+    if: always() && needs.auto-review.outputs.infra_failure == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      checks: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          # Same reason as the other jobs: no token in .git/config. The restore
+          # below fetches through the gh credential helper instead.
+          persist-credentials: false
+
+      # The `gh` bootstrap runs from the tree, ahead of the restore, because the
+      # restore fetches origin/main and needs git to be authenticated; on a
+      # pull_request event this whole file is the PR's anyway.
+      - name: Ensure GitHub CLI is available
+        run: bash .github/claude/ensure-gh.sh
+
+      # See the auto-review job for what this writes and what reads it.
+      - name: Authenticate git through the GitHub CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh auth setup-git
+
+      # This is the one job holding checks:write, which the AI job deliberately
+      # does not, so it runs main's copy of everything it can. The restore script
+      # and the `gh` bootstrap above still come from the tree, as they must; on a
+      # pull_request event so does this whole file.
+      - name: Load trusted bot files from origin/main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/claude/load-trusted-files.sh
+
+      - name: Set up publisher runtime
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Authenticate the Claude publisher
+        id: publisher_auth
+        env:
+          CLAUDE_PUBLISH_STATUS_ONLY: 'true'
+        run: node "$RUNNER_TEMP/claude-trusted/.github/claude/publisher-auth.mjs" acquire
+
+      - name: Post neutral review-status check-run
+        env:
+          GH_TOKEN: ${{ steps.publisher_auth.outputs.token }}
+          HEAD_SHA: ${{ needs.auto-review.outputs.head_sha }}
+          FAILURE_SUMMARY: ${{ needs.auto-review.outputs.failure_summary }}
+        run: |
+          if [ -z "${HEAD_SHA:-}" ]; then
+            echo "::error::HEAD_SHA unset; cannot post neutral review-status check-run"
+            exit 1
+          fi
+          # Markdown backticks are literal instructions, not shell substitutions.
+          # shellcheck disable=SC2016
+          SUMMARY=$(printf '%s\n\n%s\n%s' \
+            "No review completed. ${FAILURE_SUMMARY:-The review attempt failed; see the run logs for the cause.}" \
+            'This is **not** an approval. The review is advisory, so this check stays neutral;' \
+            'after the failure is addressed, comment `@claude` on the PR to request another review.')
+          # Name must say Claude/auto-review — GitHub sometimes attaches API check-runs under the
+          # wrong workflow heading (e.g. Typecheck); a clear name keeps the signal readable anyway.
+          DETAILS_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if ! gh api "repos/$GITHUB_REPOSITORY/check-runs" -X POST \
+            -f name='Claude auto-review — did not run' \
+            -f head_sha="$HEAD_SHA" \
+            -f details_url="$DETAILS_URL" \
+            -f external_id='claude-auto-review-infra' \
+            -f status='completed' \
+            -f conclusion='neutral' \
+            -f 'output[title]=No review completed — not an approval' \
+            -f "output[summary]=$SUMMARY"; then
+            echo "::error::Failed to post neutral Claude auto-review check-run; falling back to job failure so this is not silently green"
+            exit 1
+          fi
+          echo "Posted neutral Claude auto-review check-run for $HEAD_SHA (infra failure — auto-review stays green)"
+
+      - name: Revoke the Claude publisher token
+        if: always() && steps.publisher_auth.outputs.token != ''
+        env:
+          CLAUDE_PUBLISH_TOKEN: ${{ steps.publisher_auth.outputs.token }}
+        run: node "$RUNNER_TEMP/claude-trusted/.github/claude/publisher-auth.mjs" revoke
+
+  # Manual trigger via @claude in PR comments, review comments, or issues.
+  claude:
+    # Bots cannot reach this job at all, and that is a tested invariant —
+    # .github/claude/review-workflow.test.mjs asserts it under "bot comments cannot request
+    # follow-ups". Automation that needs a re-review dispatches the auto-review job instead;
+    # use workflow_dispatch with the PR number.
+    if: |
+      github.event.sender.type != 'Bot' &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association || github.event.review.author_association || github.event.issue.author_association) && (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: claude-review-${{ github.event.issue.number || github.event.pull_request.number || inputs.pr_number || github.run_id }}
+      cancel-in-progress: false
+    # contents: read, not write — nothing in this job commits or pushes. The
+    # model never had the write anyway (settings.json denies git push and git
+    # commit); dropping it takes the capability off the token the trusted steps
+    # carry, and off the copy the action exports into the model's shell.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          # Keep the token out of .git/config. The model steps below get a shell
+          # in this tree, and actions/checkout otherwise persists the token there
+          # as an http.extraheader. The steps that still have to fetch get their
+          # credentials from the gh helper instead — see the bootstrap below.
+          persist-credentials: false
+
+      # Ahead of the restore, which fetches origin/main and has no token in
+      # .git/config to fetch with. On this job's triggers the tree here is the
+      # default branch's — the PR head is checked out further down — so the
+      # script this runs is main's copy.
+      - name: Ensure GitHub CLI is available
+        run: bash .github/claude/ensure-gh.sh
+
+      # See the auto-review job for what this writes and what reads it.
+      - name: Authenticate git through the GitHub CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh auth setup-git
+
+      - name: Load trusted bot files from origin/main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/claude/load-trusted-files.sh
+
+      # Separate from the model action's revoked output token. Only trusted
+      # publishing steps receive this token; cleanup runs even after failure.
+      - name: Set up publisher runtime
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Authenticate the Claude publisher
+        id: publisher_auth
+        run: node "$RUNNER_TEMP/claude-trusted/.github/claude/publisher-auth.mjs" acquire
+
+      - name: Detect stale re-request and post progress indicator
+        env:
+          GH_TOKEN: ${{ steps.publisher_auth.outputs.token }}
+        run: bash .github/claude/prepare-mention-metadata.sh
+
+      # On a comment trigger the checkout is the default branch, not the PR, so
+      # the PR head is checked out explicitly. This is what the reviewer reads
+      # when it greps the codebase for callers.
+      - name: Check out the PR head
+        if: env.STALE_REQUEST != 'true' && env.IS_PR == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --no-tags origin "pull/$PR_NUMBER/head:claude-review-head"
+          # -f: the earlier restore may have left the index holding main's copy
+          # of a path this branch changes, which would otherwise abort the
+          # checkout. The restore is redone immediately below anyway.
+          #
+          # The SHA the metadata step captured, not the branch tip: the PR ref
+          # moves, and a push between the two would review a tree the reported
+          # SHA does not describe.
+          if ! git checkout -f "$HEAD_SHA"; then
+            echo "::error::PR #$PR_NUMBER moved past $HEAD_SHA before checkout"
+            exit 1
+          fi
+          # SECURITY: run the SNAPSHOT, not the tree copy. The checkout above just
+          # replaced .github/claude/ with the PR author's version, so
+          # `bash .github/claude/load-trusted-files.sh` here would execute
+          # PR-controlled shell beside this runner's tokens. This is the one place
+          # the boundary is real and holdable: on a comment trigger the workflow
+          # file is the default branch's, so an untrusted tree is the only thing
+          # that arrives from the PR. The snapshot restores the tree, so every step
+          # after this runs main's copies again.
+          bash "$RUNNER_TEMP/claude-trusted/.github/claude/load-trusted-files.sh"
+
+      # Everything the reviewer reads about the PR is fetched here, by a step that
+      # holds the token, and written to $REVIEW_IN. The model step below then runs
+      # with no token of its own at all. From the SNAPSHOT: this job checked out
+      # the PR head above, so the tree copy is the PR author's. IS_PR is already in
+      # $GITHUB_ENV from prepare-mention-metadata.sh.
+      - name: Prepare review inputs
+        if: env.STALE_REQUEST != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVIEW_MODE: rescore
+        run: bash "$RUNNER_TEMP/claude-trusted/.github/claude/prepare-review-inputs.sh"
+
+      - name: Load review prompts from base branch
+        if: env.STALE_REQUEST != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # SECURITY: load prompts from origin/main only (PR tree can rewrite them).
+          if ! git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main; then
+            echo "::error::Failed to fetch origin/main for review-prompt load"
+            exit 1
+          fi
+          load_prompt() {
+            VAR="$1"
+            PROMPT_PATH="$2"
+            if ! git show "origin/main:$PROMPT_PATH" > /tmp/prompt.md 2>/dev/null; then
+              echo "::error::Could not load $PROMPT_PATH from origin/main"
+              exit 1
+            fi
+            echo "Loaded $PROMPT_PATH from origin/main ($(wc -c < /tmp/prompt.md | tr -d ' ') bytes)"
+            # The model's Read tool takes a literal path and never expands a
+            # variable, and its Bash hook denies echo and printenv, so the prompt
+            # carries the absolute paths instead of $REVIEW_IN / $REVIEW_OUT.
+            awk -v in_dir="$REVIEW_IN" -v out_dir="$REVIEW_OUT" '
+              { gsub(/\$[{]REVIEW_IN[}]|\$REVIEW_IN/, in_dir)
+                gsub(/\$[{]REVIEW_OUT[}]|\$REVIEW_OUT/, out_dir)
+                print }
+            ' /tmp/prompt.md > /tmp/prompt.subst.md
+            mv /tmp/prompt.subst.md /tmp/prompt.md
+            # Random heredoc delimiter so prompt content can't terminate GITHUB_ENV early.
+            ATTEMPT=0
+            while [ "$ATTEMPT" -lt 3 ]; do
+              if ! RANDOM_HEX=$(openssl rand -hex 16); then
+                echo "::error::Failed to generate random heredoc delimiter"
+                exit 1
+              fi
+              DELIM="EOF_$RANDOM_HEX"
+              if ! grep -Fq "$DELIM" /tmp/prompt.md; then
+                break
+              fi
+              ATTEMPT=$((ATTEMPT + 1))
+            done
+            if [ "$ATTEMPT" -ge 3 ]; then
+              echo "::error::Could not generate unique heredoc delimiter after 3 attempts"
+              exit 1
+            fi
+            {
+              echo "$VAR<<$DELIM"
+              cat /tmp/prompt.md
+              echo "$DELIM"
+            } >> "$GITHUB_ENV"
+          }
+          load_prompt RESCORE_PROMPT .github/claude/rescore-prompt.md
+          load_prompt VERIFY_PROMPT .github/claude/verify-findings-prompt.md
+          load_prompt RECOMPOSE_PROMPT .github/claude/recompose-review-prompt.md
+
+      # See the auto-review job for why the schemas are single-quoted.
+      - name: Load the structured-output schemas
+        if: env.STALE_REQUEST != 'true'
+        run: |
+          load_schema_arg() {
+            VAR="$1"
+            SCHEMA_PATH="$2"
+            if ! COMPACT=$(jq -c . "$SCHEMA_PATH" 2>/dev/null); then
+              echo "::error::$SCHEMA_PATH is missing or not valid JSON"
+              exit 1
+            fi
+            # An apostrophe would close the single quote around the value, so each
+            # one is re-emitted as '\'', the way a literal ' survives a
+            # single-quoted shell token, and what shell-quote parses it back to.
+            echo "$VAR=$(printf '%s' "$COMPACT" | sed "s/'/'\\\\''/g")" >> "$GITHUB_ENV"
+          }
+          load_schema_arg REVIEW_SCHEMA_ARG .github/claude/review-schema.json
+          load_schema_arg VERDICTS_SCHEMA_ARG .github/claude/verdicts-schema.json
+          load_schema_arg RECOMPOSE_SCHEMA_ARG .github/claude/recompose-schema.json
+
+      # On a PR the answer is the review object and the schema holds the model to
+      # it. On a plain issue the answer is free text, and passing --json-schema
+      # there would hold a prose answer to a review shape it is not. The flags are
+      # built here rather than in two mutually exclusive action steps so that
+      # `claude_run` stays one step id — six later conditions read its outcome.
+      - name: Build the reviewer's CLI arguments
+        if: env.STALE_REQUEST != 'true'
+        run: |
+          ARGS="--model $CLAUDE_REVIEW_MODEL --effort $CLAUDE_REVIEW_EFFORT --max-turns 120"
+          ARGS="$ARGS --disallowed-tools Task,WebFetch,WebSearch,Write,Edit,MultiEdit,NotebookEdit"
+          if [ "${IS_PR:-}" = "true" ]; then
+            ARGS="$ARGS --json-schema '$REVIEW_SCHEMA_ARG'"
+          fi
+          echo "CLAUDE_ARGS=$ARGS" >> "$GITHUB_ENV"
+
+      # No GH_TOKEN here: the model reads $REVIEW_IN and returns its re-score as
+      # structured output, and the publish step below is what talks to GitHub. A
+      # token in this step is a write primitive for anything the triggering comment
+      # talks the model into. See the auto-review job for the residual token the
+      # `gh` deny in settings.json exists for.
+      - name: Run Claude Code
+        id: claude_run
+        if: env.STALE_REQUEST != 'true'
+        uses: anthropics/claude-code-action@fa2b2666b747000bf42767d1f332065b375e3c8f # v1.0.214
+        continue-on-error: true
+        env:
+          PR_NUMBER: ${{ env.PR_NUMBER }}
+          HEAD_SHA: ${{ env.HEAD_SHA }}
+          SHORT_SHA: ${{ env.SHORT_SHA }}
+          REVIEW_NUMBER: ${{ env.REVIEW_NUMBER }}
+          COMMIT_MSG: ${{ env.COMMIT_MSG }}
+          TRIGGER_COMMENT: ${{ env.TRIGGER_COMMENT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          REVIEW_IN: ${{ env.REVIEW_IN }}
+          REVIEW_OUT: ${{ env.REVIEW_OUT }}
+          REVIEW_MODE: rescore
+          CLAUDE_HOOK_DIR: ${{ runner.temp }}/claude-trusted/.github/claude
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          display_report: false
+          classify_inline_comments: false
+          prompt: ${{ env.RESCORE_PROMPT }}
+          settings: ${{ runner.temp }}/claude-trusted/.github/claude/settings.json
+          claude_args: ${{ env.CLAUDE_ARGS }}
+          additional_permissions: |
+            actions: read
+
+      # On a plain issue the answer is free text, not the review object, so it
+      # goes to response.md and the publisher posts it as a comment.
+      - name: Capture the re-score
+        id: capture_review
+        if: always() && env.STALE_REQUEST != 'true' && steps.claude_run.outcome == 'success'
+        continue-on-error: true
+        env:
+          STRUCTURED_OUTPUT: ${{ steps.claude_run.outputs.structured_output }}
+          EXECUTION_FILE: ${{ steps.claude_run.outputs.execution_file }}
+        run: |
+          if [ "${IS_PR:-}" = "true" ]; then
+            if [ -z "${STRUCTURED_OUTPUT:-}" ]; then
+              echo "::error::The re-score step returned no structured output; nothing to publish"
+              exit 1
+            fi
+            printf '%s' "$STRUCTURED_OUTPUT" > "$REVIEW_OUT/review.json"
+            if ! jq empty "$REVIEW_OUT/review.json" 2>/dev/null; then
+              echo "::error::The re-score step's structured output is not valid JSON"
+              exit 1
+            fi
+            echo "Captured review.json ($(wc -c < "$REVIEW_OUT/review.json" | tr -d ' ') bytes, $(jq '.findings | length' "$REVIEW_OUT/review.json") findings)"
+            echo "has_findings=$(jq '.findings | length > 0' "$REVIEW_OUT/review.json")" >> "$GITHUB_OUTPUT"
+          else
+            # No schema was passed for an issue, so there is no structured output
+            # to read; the answer is the final `result` message. The action writes
+            # the SDK message stream as a JSON array
+            # (base-action/src/execution-file.ts:16,25) and exposes its path as
+            # `execution_file` (:34-41).
+            if [ -z "${EXECUTION_FILE:-}" ] || [ ! -s "$EXECUTION_FILE" ]; then
+              echo "::error::The run left no execution file at '${EXECUTION_FILE:-<unset>}'; nothing to publish"
+              exit 1
+            fi
+            ANSWER=$(jq -r 'last(.[] | select(.type == "result")) | .result // empty' \
+              "$EXECUTION_FILE" 2>/dev/null || echo "")
+            if [ -z "$ANSWER" ]; then
+              echo "::error::$EXECUTION_FILE carries no final result message; nothing to publish"
+              exit 1
+            fi
+            printf '%s\n' "$ANSWER" > "$REVIEW_OUT/response.md"
+            echo "Captured response.md ($(wc -c < "$REVIEW_OUT/response.md" | tr -d ' ') bytes)"
+          fi
+
+      # Before the verifier runs — see the auto-review job.
+      - name: Extract re-score usage
+        if: always() && env.REVIEW_OUT != ''
+        env:
+          EXECUTION_FILE: ${{ steps.claude_run.outputs.execution_file }}
+        run: bash "$RUNNER_TEMP/claude-trusted/.github/claude/extract-usage.sh" review
+
+      - name: Verify the review findings
+        id: claude_verify
+        if: always() && env.IS_PR == 'true' && steps.capture_review.outcome == 'success' && steps.capture_review.outputs.has_findings == 'true'
+        uses: anthropics/claude-code-action@fa2b2666b747000bf42767d1f332065b375e3c8f # v1.0.214
+        continue-on-error: true
+        env:
+          REVIEW_IN: ${{ env.REVIEW_IN }}
+          REVIEW_OUT: ${{ env.REVIEW_OUT }}
+          CLAUDE_HOOK_DIR: ${{ runner.temp }}/claude-trusted/.github/claude
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          display_report: false
+          classify_inline_comments: false
+          prompt: ${{ env.VERIFY_PROMPT }}
+          settings: ${{ runner.temp }}/claude-trusted/.github/claude/settings.json
+          claude_args: --model ${{ env.CLAUDE_REVIEW_MODEL }} --effort ${{ env.CLAUDE_REVIEW_EFFORT }} --max-turns 40 --disallowed-tools Task,WebFetch,WebSearch,Write,Edit,MultiEdit,NotebookEdit --json-schema '${{ env.VERDICTS_SCHEMA_ARG }}'
+
+      # A warning, not a failure: with no verdicts file the publisher posts every
+      # finding, which is what the bot did before this pass existed.
+      - name: Capture the verdicts
+        id: capture_verdicts
+        if: always() && env.IS_PR == 'true' && steps.capture_review.outcome == 'success' && steps.capture_review.outputs.has_findings == 'true'
+        continue-on-error: true
+        env:
+          STRUCTURED_OUTPUT: ${{ steps.claude_verify.outputs.structured_output }}
+        run: |
+          if [ -z "${STRUCTURED_OUTPUT:-}" ]; then
+            echo "::warning::The verifier returned no structured output; every finding will be posted"
+            exit 0
+          fi
+          printf '%s' "$STRUCTURED_OUTPUT" > "$REVIEW_OUT/verdicts.json"
+          if ! jq -e 'type == "object" and (.verdicts | type == "array") and
+              all(.verdicts[]; (.index | type == "number") and .index >= 0 and .index == (.index | floor)
+                and (.supported | type == "boolean") and (.reason | type == "string"))' \
+              "$REVIEW_OUT/verdicts.json" > /dev/null 2>&1; then
+            echo "::warning::The verifier's structured output is not a valid verdicts object; every finding will be posted"
+            rm -f "$REVIEW_OUT/verdicts.json"
+            exit 0
+          fi
+          echo "valid=true" >> "$GITHUB_OUTPUT"
+          echo "Captured verdicts.json ($(jq '[.verdicts[] | select(.supported | not)] | length' "$REVIEW_OUT/verdicts.json") of $(jq '.verdicts | length' "$REVIEW_OUT/verdicts.json") findings not supported)"
+
+      # Only when the verifier actually ran. A skipped step has no execution_file
+      # output, so this would write a usage-verify.json of `unknown`, and one
+      # unknown pass makes the whole run's totals unknown in the ledger
+      # (update-usage-ledger.sh, `field()`), marking the available total incomplete.
+      - name: Extract verifier usage
+        if: always() && env.REVIEW_OUT != '' && steps.claude_verify.outcome != 'skipped'
+        env:
+          EXECUTION_FILE: ${{ steps.claude_verify.outputs.execution_file }}
+        run: bash "$RUNNER_TEMP/claude-trusted/.github/claude/extract-usage.sh" verify
+
+      # See the auto-review job for what this pass is and why --resume reaches the
+      # CLI at all. Mirrors publish-review.sh's own rule (verdict_of): the LAST
+      # verdict entry for an index wins, and a finding with no verdict entry is
+      # rejected too, not just one whose last verdict has supported == false, so
+      # a `{"verdicts": []}` response counts as rejecting everything here exactly
+      # as it does in the publisher.
+      - name: Count the rejected findings
+        if: always() && env.IS_PR == 'true' && steps.capture_review.outcome == 'success'
+        run: |
+          REJECTED=0
+          if [ -s "$REVIEW_OUT/verdicts.json" ]; then
+            REJECTED=$(jq -n --slurpfile r "$REVIEW_OUT/review.json" --slurpfile v "$REVIEW_OUT/verdicts.json" \
+              '[range(0; ($r[0].findings | length)) as $i
+                | select((([$v[0].verdicts[]? | select(.index == $i)] | last | .supported) // false) != true)]
+               | length' 2>/dev/null || echo 0)
+          fi
+          echo "REJECTED_COUNT=$REJECTED" >> "$GITHUB_ENV"
+          echo "Rejected findings: $REJECTED"
+
+      - name: Recompose the review without the rejected findings
+        id: claude_recompose
+        if: >-
+          always() &&
+          env.IS_PR == 'true' &&
+          steps.capture_review.outcome == 'success' &&
+          env.REJECTED_COUNT != '' &&
+          env.REJECTED_COUNT != '0' &&
+          steps.claude_run.outputs.session_id != ''
+        uses: anthropics/claude-code-action@fa2b2666b747000bf42767d1f332065b375e3c8f # v1.0.214
+        continue-on-error: true
+        env:
+          HEAD_SHA: ${{ env.HEAD_SHA }}
+          REVIEW_IN: ${{ env.REVIEW_IN }}
+          REVIEW_OUT: ${{ env.REVIEW_OUT }}
+          CLAUDE_HOOK_DIR: ${{ runner.temp }}/claude-trusted/.github/claude
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          display_report: false
+          classify_inline_comments: false
+          prompt: ${{ env.RECOMPOSE_PROMPT }}
+          settings: ${{ runner.temp }}/claude-trusted/.github/claude/settings.json
+          claude_args: --model ${{ env.CLAUDE_REVIEW_MODEL }} --effort ${{ env.CLAUDE_REVIEW_EFFORT }} --max-turns 10 --resume ${{ steps.claude_run.outputs.session_id }} --disallowed-tools Task,WebFetch,WebSearch,Write,Edit,MultiEdit,NotebookEdit --json-schema '${{ env.RECOMPOSE_SCHEMA_ARG }}'
+
+      # A warning, never a failure — see the auto-review job.
+      - name: Capture the recomposed review
+        id: capture_recompose
+        if: always() && steps.claude_recompose.outcome == 'success'
+        continue-on-error: true
+        env:
+          STRUCTURED_OUTPUT: ${{ steps.claude_recompose.outputs.structured_output }}
+        run: |
+          RECOMPOSED="$RUNNER_TEMP/recomposed.json"
+          MERGED="$RUNNER_TEMP/review-recomposed.json"
+          BODY="$RUNNER_TEMP/recomposed-body.md"
+          if [ -z "${STRUCTURED_OUTPUT:-}" ]; then
+            echo "::warning::The recompose pass returned no structured output; posting the review body as first written"
+            exit 0
+          fi
+          printf '%s' "$STRUCTURED_OUTPUT" > "$RECOMPOSED"
+          if ! jq -e '.review_markdown | type == "string"' "$RECOMPOSED" > /dev/null 2>&1; then
+            echo "::warning::The recompose pass returned no review_markdown string; posting the review body as first written"
+            exit 0
+          fi
+          jq -r '.review_markdown' "$RECOMPOSED" > "$BODY"
+          if ! grep -q '[^[:space:]]' "$BODY" \
+            || ! grep -qF '<!-- score:' "$BODY" \
+            || ! grep -qF "$HEAD_SHA" "$BODY"; then
+            echo "::warning::The recomposed body is empty or does not carry the score marker and $HEAD_SHA; posting the review body as first written"
+            exit 0
+          fi
+          if ! jq --slurpfile recomposed "$RECOMPOSED" \
+              '.review_markdown = $recomposed[0].review_markdown' \
+              "$REVIEW_OUT/review.json" > "$MERGED"; then
+            echo "::warning::Could not merge the recomposed body into review.json; posting the review body as first written"
+            exit 0
+          fi
+          mv "$MERGED" "$REVIEW_OUT/review.json"
+          echo "valid=true" >> "$GITHUB_OUTPUT"
+          echo "Recomposed the review body ($(wc -c < "$BODY" | tr -d ' ') bytes) around $REJECTED_COUNT rejected finding(s)"
+
+      - name: Extract recompose usage
+        if: always() && env.REVIEW_OUT != '' && steps.claude_recompose.outcome != 'skipped'
+        env:
+          EXECUTION_FILE: ${{ steps.claude_recompose.outputs.execution_file }}
+        run: bash "$RUNNER_TEMP/claude-trusted/.github/claude/extract-usage.sh" recompose
+
+      # SECURITY: from the snapshot, not the tree — the model steps above had a
+      # shell, so the tree is no longer trustworthy afterwards.
+      - name: Determine review completeness
+        if: always() && env.REVIEW_OUT != '' && steps.capture_review.outcome == 'success'
+        env:
+          HAS_FINDINGS: ${{ steps.capture_review.outputs.has_findings }}
+          VERDICTS_VALID: ${{ steps.capture_verdicts.outputs.valid }}
+          RECOMPOSE_VALID: ${{ steps.capture_recompose.outputs.valid }}
+        run: |
+          INCOMPLETE=false
+          if [ "${IS_PR:-true}" = "true" ]; then
+            if [ "$HAS_FINDINGS" != "false" ] && [ "$VERDICTS_VALID" != "true" ]; then INCOMPLETE=true; fi
+            if [ "${REJECTED_COUNT:-0}" != "0" ] && [ "$RECOMPOSE_VALID" != "true" ]; then INCOMPLETE=true; fi
+          fi
+          echo "REVIEW_INCOMPLETE=$INCOMPLETE" >> "$GITHUB_ENV"
+
+      - name: Publish review
+        id: publish_review
+        if: always() && env.STALE_REQUEST != 'true' && steps.capture_review.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.publisher_auth.outputs.token }}
+        run: bash "$RUNNER_TEMP/claude-trusted/.github/claude/publish-review.sh"
+
+      # No inputs prepared means no model ran, so there is nothing to record: a
+      # stale re-request would otherwise add a row of "unknown".
+      - name: Update usage ledger
+        if: always() && env.REVIEW_OUT != ''
+        env:
+          GH_TOKEN: ${{ steps.publisher_auth.outputs.token }}
+          CLAUDE_MODEL: ${{ env.CLAUDE_REVIEW_MODEL }}
+          CLAUDE_EFFORT: ${{ env.CLAUDE_REVIEW_EFFORT }}
+        run: bash "$RUNNER_TEMP/claude-trusted/.github/claude/update-usage-ledger.sh"
+
+      - name: Verify review was posted
+        continue-on-error: true
+        id: verify_response
+        if: always() && env.STALE_REQUEST != 'true'
+        env:
+          GH_TOKEN: ${{ steps.publisher_auth.outputs.token }}
+          MODEL_OUTCOME: ${{ steps.claude_run.outcome }}
+          CAPTURE_OUTCOME: ${{ steps.capture_review.outcome }}
+          PUBLISH_OUTCOME: ${{ steps.publish_review.outcome }}
+        run: bash "$RUNNER_TEMP/claude-trusted/.github/claude/verify-published-review.sh"
+
+      - name: Update progress indicator
+        if: always() && env.STALE_REQUEST != 'true'
+        env:
+          GH_TOKEN: ${{ steps.publisher_auth.outputs.token }}
+          REVIEW_OUTCOME: ${{ (steps.claude_run.outcome == 'success' && steps.capture_review.outcome == 'success' && steps.publish_review.outcome == 'success') && 'success' || 'failure' }}
+          MODEL_OUTCOME: ${{ steps.claude_run.outcome }}
+          MODEL_EXECUTION_FILE: ${{ steps.claude_run.outputs.execution_file }}
+          CAPTURE_OUTCOME: ${{ steps.capture_review.outcome }}
+          PUBLISH_OUTCOME: ${{ steps.publish_review.outcome }}
+          RESPONSE_MISSING: ${{ steps.verify_response.outputs.response_missing }}
+          PROGRESS_VERB: Re-score
+        run: bash "$RUNNER_TEMP/claude-trusted/.github/claude/update-progress.sh"
+
+      - name: Resolve the comment reaction
+        if: always() && (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment')
+        env:
+          GH_TOKEN: ${{ steps.publisher_auth.outputs.token }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENT_SCOPE: ${{ github.event_name == 'pull_request_review_comment' && 'pulls' || 'issues' }}
+        # A stale re-request skips the reviewer step by design, so claude_run's
+        # outcome is 'skipped' and this would otherwise resolve to 'failure' — a
+        # correctly declined request is a success.
+        run: bash "$RUNNER_TEMP/claude-trusted/.github/claude/react-to-comment.sh" ${{ (env.STALE_REQUEST == 'true' || (steps.claude_run.outcome == 'success' && steps.publish_review.outcome == 'success' && steps.verify_response.outputs.response_missing != 'true' && env.REVIEW_INCOMPLETE != 'true')) && 'success' || 'failure' }}
+
+      - name: Fail job if the response was not published
+        if: always() && env.STALE_REQUEST != 'true'
+        env:
+          GATE_MODE: mention
+          MODEL_OUTCOME: ${{ steps.claude_run.outcome }}
+          REVIEW_MISSING: ${{ steps.verify_response.outputs.response_missing }}
+        run: bash "$RUNNER_TEMP/claude-trusted/.github/claude/review-outcome-gate.sh"
+
+      - name: Revoke the Claude publisher token
+        if: always() && steps.publisher_auth.outputs.token != ''
+        env:
+          CLAUDE_PUBLISH_TOKEN: ${{ steps.publisher_auth.outputs.token }}
+        run: node "$RUNNER_TEMP/claude-trusted/.github/claude/publisher-auth.mjs" revoke

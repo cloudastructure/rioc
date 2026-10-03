@@ -1,0 +1,53 @@
+[
+  {
+    "type": "system",
+    "subtype": "init",
+    "session_id": "7ee7c202-bc6c-4da9-b8d6-c748b749856e"
+  },
+  {
+    "type": "assistant",
+    "message": {
+      "model": "claude-opus-5",
+      "usage": {
+        "input_tokens": 1871,
+        "output_tokens": 412,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 20850
+      }
+    }
+  },
+  {
+    "type": "assistant",
+    "message": {
+      "model": "claude-opus-5",
+      "usage": {
+        "input_tokens": 96,
+        "output_tokens": 1204,
+        "cache_read_input_tokens": 22721,
+        "cache_creation_input_tokens": 3140
+      }
+    }
+  },
+  {
+    "type": "result",
+    "subtype": "success",
+    "is_error": false,
+    "duration_ms": 61234,
+    "num_turns": 7,
+    "total_cost_usd": 0,
+    "modelUsage": {
+      "claude-opus-5": {
+        "contextWindow": 200000,
+        "maxOutputTokens": 64000
+      }
+    },
+    "usage": {
+      "input_tokens": 1967,
+      "output_tokens": 1616,
+      "cache_read_input_tokens": 22721,
+      "cache_creation_input_tokens": 23990,
+      "service_tier": "standard"
+    },
+    "result": "Review written."
+  }
+]

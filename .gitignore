@@ -33,3 +33,6 @@ Thumbs.db
 
 # YOLO model weights (auto-downloaded at runtime)
 *.pt
+
+# Local review settings and output
+.claude/settings.local.json
